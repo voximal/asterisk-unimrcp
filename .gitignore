@@ -51,3 +51,4 @@
 /res-speech-unimrcp/.deps
 /res-speech-unimrcp/Makefile.in
 /res-speech-unimrcp/Makefile
+*.org

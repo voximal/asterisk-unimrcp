@@ -58,7 +58,7 @@
 
 #if AST_VERSION_AT_LEAST(1,4,0)
 #define AST_COMPAT_STATIC static
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.14 $")
 #else  /* 1.2 */
 #define AST_MODULE_LOAD_DECLINE -1
 #define AST_COMPAT_STATIC
@@ -105,7 +105,7 @@ static apt_bool_t unimrcp_log(const char *file, int line, const char *id, apt_lo
 	if (strlen(format) == 0)
 		return TRUE;
 
-	/* Assume apr_vsnprintf supports format extensions required by UniMRCP. */ 
+	/* Assume apr_vsnprintf supports format extensions required by UniMRCP. */
 	apr_vsnprintf(log_message, sizeof(log_message) - 1, format, arg_ptr);
 	log_message[sizeof(log_message) - 1] = '\0';
 
@@ -131,7 +131,7 @@ static apt_bool_t unimrcp_log(const char *file, int line, const char *id, apt_lo
 			break;
 	}
 
-	ast_log(level, file, line, NULL, "%s\n", log_message);
+	ast_log(level, file, line, "unimrcp_log", "%s\n", log_message);
 	return TRUE;
 }
 
@@ -187,7 +187,7 @@ AST_COMPAT_STATIC int load_module(void)
 		apr_initialized = 0;
 		return AST_MODULE_LOAD_DECLINE;
 	}
-	
+
 	/* Load the applications. */
 	load_mrcpsynth_app();
 	load_mrcprecog_app();
@@ -292,6 +292,10 @@ AST_COMPAT_STATIC int reload(void)
 {
 	return 0;
 }
+
+// i6net : Allows load module build in a different environment
+#undef AST_BUILDOPT_SUM
+#define AST_BUILDOPT_SUM ""
 
 #if AST_VERSION_AT_LEAST(1,4,0)
 AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "MRCP suite of applications",

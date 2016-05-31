@@ -28,7 +28,7 @@
 #include "ast_compat_defs.h"
 
 #define AST_MODULE "res_speech_unimrcp" 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.74 $")
 
 #include <asterisk/module.h>
 #include <asterisk/config.h>
@@ -46,13 +46,24 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: $")
 #include <mrcp_recog_header.h>
 #include <mrcp_recog_resource.h>
 #include <mpf_frame_buffer.h>
+#include <mpf_engine.h>
+#include <mpf_codec_manager.h>
+#include <mpf_dtmf_generator.h>
+#include <mpf_rtp_termination_factory.h>
 #include <apt_nlsml_doc.h>
 #include <apt_pool.h>
 #include <apt_log.h>
 
 
+
 #define UNI_ENGINE_NAME "unimrcp"
 #define UNI_ENGINE_CONFIG "res-speech-unimrcp.conf"
+
+/* Force uniMRCP directory */
+#ifdef UNIMRCP_DIR_LOCATION
+#undef UNIMRCP_DIR_LOCATION
+#endif
+#define UNIMRCP_DIR_LOCATION "/usr/local/unimrcp"
 
 /** Timeout to wait for asynchronous response (actually this timeout shouldn't expire) */
 #define MRCP_APP_REQUEST_TIMEOUT 60 * 1000000
@@ -70,6 +81,8 @@ struct uni_speech_t {
 	mrcp_session_t        *session;
 	/* Client channel */
 	mrcp_channel_t        *channel;
+	/* UniMRCP stream object. */
+	mpf_audio_stream_t *stream;
 	/* Asterisk speech base */
 	struct ast_speech     *speech_base;
 
@@ -84,6 +97,15 @@ struct uni_speech_t {
 	/* Active grammars (Content-IDs) */
 	apr_hash_t            *active_grammars;
 
+	/* Binary grammars (Content-IDs) */
+	apr_hash_t            *binary_grammars;
+
+	/* MRCP properties (header fields) loaded from grammarload */
+	mrcp_message_header_t *properties;
+
+  /* Language */
+	char                  language[50];
+
 	/* Is session management request in-progress or not */
 	apt_bool_t             is_sm_request;
 	/* Session management request sent to server */
@@ -93,13 +115,16 @@ struct uni_speech_t {
 
 	/* Is recognition in-progress or not */
 	apt_bool_t             is_inprogress;
-
+	
 	/* In-progress request sent to server */
 	mrcp_message_t        *mrcp_request;
 	/* Response received from server */
 	mrcp_message_t        *mrcp_response;
 	/* Event received from server */
 	mrcp_message_t        *mrcp_event;
+
+  /* UniMRCP DTMF digit generator. */
+	mpf_dtmf_generator_t  *dtmf_generator;
 };
 
 /** \brief Declaration of UniMRCP based recognition engine */
@@ -129,6 +154,23 @@ struct uni_engine_t {
 	apr_thread_mutex_t    *mutex;
 	/* Current speech object number. */
 	apr_uint16_t           current_speech_index;
+
+	/* Current speech sessions. */
+	apr_uint16_t           current_speech_sessions;
+	/* Max speech sessions. */
+	apr_uint16_t           max_speech_sessions;
+
+
+	/* Options for ASR providers */
+  apt_bool_t cancelifqueue; // option for Vestec
+  apt_bool_t startinputtimers;
+  apt_bool_t dtmfstopspeech;
+  apt_bool_t returnnlsml;
+  apt_bool_t vendorspecificparameters; // option for Nuance
+  apt_bool_t setparams; // option for Nuance
+  apt_bool_t removeswi; // option for Nuance
+  apt_bool_t setspeechlanguage; // option for Nuance
+  apt_bool_t binarygrammars; // option for Nuance
 };
 
 static struct uni_engine_t uni_engine;
@@ -136,10 +178,13 @@ static struct uni_engine_t uni_engine;
 static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compat *format);
 static apt_bool_t uni_recog_channel_create(uni_speech_t *uni_speech, ast_format_compat *format);
 static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech);
+static apt_bool_t uni_recog_start_input_timers(uni_speech_t *uni_speech);
 static apt_bool_t uni_recog_grammars_preload(uni_speech_t *uni_speech);
 static apt_bool_t uni_recog_sm_request_send(uni_speech_t *uni_speech, mrcp_sig_command_e sm_request);
 static apt_bool_t uni_recog_mrcp_request_send(uni_speech_t *uni_speech, mrcp_message_t *message);
 static void uni_recog_cleanup(uni_speech_t *uni_speech);
+
+
 
 /** \brief Backward compatible define for the const qualifier */
 #if AST_VERSION_AT_LEAST(1,8,0)
@@ -199,22 +244,51 @@ static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compa
 	mrcp_session_t *session;
 	apr_pool_t *pool;
 	const mpf_codec_descriptor_t *descriptor;
+  const char *profile = NULL;
+
+  if(uni_engine.mutex) apr_thread_mutex_lock(uni_engine.mutex);
+
+  profile = strchr(speech->engine->name, ':');
+  if (!profile)
+  profile = uni_engine.profile;
+  else
+  profile++;
 
 	/* Create session instance */
-	session = mrcp_application_session_create(uni_engine.application,uni_engine.profile,speech);
+	session = mrcp_application_session_create(uni_engine.application, profile, speech);
 	if(!session) {
 		ast_log(LOG_ERROR, "Failed to create MRCP session\n");
 		return -1;
 	}
+
+	if (uni_engine.current_speech_sessions >= uni_engine.max_speech_sessions)
+	{
+		ast_log(LOG_ERROR, "Too much MRCP session running!\n");
+  	if(uni_engine.mutex) apr_thread_mutex_unlock(uni_engine.mutex);
+		return -1;
+	}
+	else
+	{
+    uni_engine.current_speech_sessions++;
+
+		ast_log(LOG_DEBUG, "Speech sessions :%d/%d\n",
+		 uni_engine.current_speech_sessions,
+		 uni_engine.max_speech_sessions);
+	}
+
+	if(uni_engine.mutex) apr_thread_mutex_unlock(uni_engine.mutex);
+
 	pool = mrcp_application_session_pool_get(session);
 	uni_speech = apr_palloc(pool,sizeof(uni_speech_t));
 	uni_speech->name = apr_psprintf(pool, "RSU-%hu", uni_speech_id_get());
 	uni_speech->session = session;
+  uni_speech->stream = NULL;
 	uni_speech->channel = NULL;
 	uni_speech->wait_object = NULL;
 	uni_speech->mutex = NULL;
 	uni_speech->media_buffer = NULL;
 	uni_speech->active_grammars = apr_hash_make(pool);
+	uni_speech->binary_grammars = apr_hash_make(pool);
 	uni_speech->is_sm_request = FALSE;
 	uni_speech->is_inprogress = FALSE;
 	uni_speech->sm_request = 0;
@@ -222,6 +296,9 @@ static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compa
 	uni_speech->mrcp_request = NULL;
 	uni_speech->mrcp_response = NULL;
 	uni_speech->mrcp_event = NULL;
+	uni_speech->properties = NULL;
+	uni_speech->language[0] = 0;
+  uni_speech->dtmf_generator = NULL;
 
 	uni_speech->speech_base = speech;
 	speech->data = uni_speech;
@@ -274,6 +351,8 @@ static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compa
 		return -1;
 	}
 
+
+
 	/* Set properties for session */
 	uni_recog_properties_set(uni_speech);
 	/* Preload grammars */
@@ -285,7 +364,11 @@ static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compa
 static int uni_recog_destroy(struct ast_speech *speech)
 {
 	uni_speech_t *uni_speech = speech->data;
-	ast_log(LOG_NOTICE, "(%s) Destroy speech resource\n",uni_speech->name);
+
+	if (!uni_speech)
+	return -1;
+
+  ast_log(LOG_NOTICE, "(%s) Destroy speech resource\n",uni_speech->name);
 
 	/* Terminate session first */
 	uni_recog_sm_request_send(uni_speech,MRCP_SIG_COMMAND_SESSION_TERMINATE);
@@ -297,6 +380,14 @@ static int uni_recog_destroy(struct ast_speech *speech)
 /*! \brief Cleanup already allocated data */
 static void uni_recog_cleanup(uni_speech_t *uni_speech)
 {
+  ast_log(LOG_DEBUG, "(%s) Clean up recognition\n",uni_speech->name);
+
+	if (uni_speech->properties)
+	{
+    mrcp_message_header_destroy(uni_speech->properties);
+    uni_speech->properties = NULL;
+	}
+
 	if(uni_speech->speech_base) {
 		uni_speech->speech_base->data = NULL;
 	}
@@ -313,8 +404,22 @@ static void uni_recog_cleanup(uni_speech_t *uni_speech)
 		uni_speech->media_buffer = NULL;
 	}
 
-	if(mrcp_application_session_destroy(uni_speech->session) != TRUE) {
-		ast_log(LOG_WARNING, "(%s) Failed to destroy application session\n",uni_speech->name);
+	if (uni_speech->session) {
+	  if (uni_speech->speech_base)
+    mrcp_application_session_object_set(uni_speech->session, NULL);
+		else
+		{
+      ast_log(LOG_DEBUG, "(%s) Destroy application session\n", uni_speech->name);
+  		mrcp_application_session_destroy(uni_speech->session);
+		}
+
+    uni_speech->session = NULL;
+	}
+
+  if (uni_speech->speech_base)
+	{
+	  uni_speech->speech_base->data = NULL;
+	  uni_speech->speech_base = NULL;
 	}
 }
 
@@ -324,11 +429,16 @@ static int uni_recog_stop(struct ast_speech *speech)
 	uni_speech_t *uni_speech = speech->data;
 	mrcp_message_t *mrcp_message;
 
+	if (uni_speech->properties)
+	{
+
+	}
+	
 	if(!uni_speech->is_inprogress) {
 		return 0;
 	}
 
-	ast_log(LOG_NOTICE, "(%s) Stop recognition\n",uni_speech->name);
+  ast_log(LOG_NOTICE, "(%s) Stop recognition\n",uni_speech->name);
 	mrcp_message = mrcp_application_message_create(
 								uni_speech->session,
 								uni_speech->channel,
@@ -337,21 +447,27 @@ static int uni_recog_stop(struct ast_speech *speech)
 		ast_log(LOG_WARNING, "(%s) Failed to create MRCP message\n",uni_speech->name);
 		return -1;
 	}
-
+	
 	/* Reset last event (if any) */
 	uni_speech->mrcp_event = NULL;
 
 	/* Send MRCP request and wait for response */
 	if(uni_recog_mrcp_request_send(uni_speech,mrcp_message) != TRUE) {
-		ast_log(LOG_WARNING, "(%s) Failed to stop recognition\n",uni_speech->name);
+    ast_log(LOG_WARNING, "(%s) Failed to stop recognition\n",uni_speech->name);
 		return -1;
 	}
 
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return -1;
+	}
+	
 	/* Reset media buffer */
 	mpf_frame_buffer_restart(uni_speech->media_buffer);
-
+	
 	ast_speech_change_state(speech, AST_SPEECH_STATE_NOT_READY);
-
+	
 	uni_speech->is_inprogress = FALSE;
 	return 0;
 }
@@ -367,6 +483,24 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 	char *tmp;
 	apr_file_t *file;
 	apt_str_t *body = NULL;
+	int prop = 0;
+  apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
+  const char *key;
+  char *val;
+
+  if (uni_engine.binarygrammars)
+  if (!strncmp(grammar_path, "uri:", 4))
+  if (strstr(grammar_path, ".gram") || strstr(grammar_path, ".gout") || strstr(grammar_path, ".grbin"))
+  {
+    grammar_path+=4;
+
+    ast_log(LOG_DEBUG, "(%s) Load binary grammar: %s (%s)\n",uni_speech->name,grammar_name, grammar_path);
+    key = apr_pstrdup(pool,grammar_name);
+    val = apr_pstrdup(pool,grammar_path);
+	  apr_hash_set(uni_speech->binary_grammars,key,APR_HASH_KEY_STRING,val);
+
+    return 0;
+  }
 
 	mrcp_message = mrcp_application_message_create(
 								uni_speech->session,
@@ -377,7 +511,7 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 		return -1;
 	}
 
-	/* 
+	/*
 	 * Grammar name and path are mandatory attributes, 
 	 * grammar type can be optionally specified with path.
 	 *
@@ -385,12 +519,14 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 	 * SpeechLoadGrammar(name|type:path)
 	 * SpeechLoadGrammar(name|uri:path)
 	 * SpeechLoadGrammar(name|builtin:grammar/digits)
+	 * SpeechLoadGrammar(value|property:name)
 	 */
 
 	tmp = strchr(grammar_path,':');
 	if(tmp) {
 		const char builtin_token[] = "builtin";
 		const char uri_token[] = "uri";
+		const char property_token[] = "property";
 		if(strncmp(grammar_path,builtin_token,sizeof(builtin_token)-1) == 0) {
 			content_type = "text/uri-list";
 			inline_content = TRUE;
@@ -400,11 +536,114 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 			inline_content = TRUE;
 			grammar_path = tmp+1;
 		}
+		else if(strncmp(grammar_path,property_token,sizeof(property_token)-1) == 0) {
+			prop = 1;
+			inline_content = TRUE;
+			grammar_path = tmp+1;
+      tmp = strchr(grammar_path,'=');
+			if (tmp)
+			{
+				*tmp = 0;
+        grammar_name=tmp+1;
+			}
+
+      if(strncmp(grammar_path,"Speech-Language",sizeof("Speech-Language")-1) == 0) {
+        uni_speech->language[0]=0;
+        ast_log(LOG_DEBUG, "Language grammar properties set :%s.\n", grammar_name);
+
+        if (uni_engine.setspeechlanguage)
+        strncpy(uni_speech->language, grammar_name, sizeof(uni_speech->language)-1);
+        else
+        return 0;
+      }
+		}
 		else {
 			*tmp = '\0';
 			content_type = grammar_path;
 			grammar_path = tmp+1;
 		}
+	}
+
+	if (prop)
+	{
+    /* Inherit properties */
+		if (uni_speech->properties == NULL)
+		{
+#if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
+	    uni_speech->properties = mrcp_message_header_create(
+		    mrcp_generic_header_vtable_get(mrcp_message->start_line.version),
+		    mrcp_recog_header_vtable_get(mrcp_message->start_line.version),
+		    pool);
+#else
+	    uni_speech->properties = apr_palloc(pool,sizeof(mrcp_message_header_t));
+	    mrcp_message_header_init(speech->properties);
+	    speech->properties->generic_header_accessor.vtable = mrcp_generic_header_vtable_get(mrcp_message->start_line.version);
+    	speech->properties->resource_header_accessor.vtable = mrcp_recog_header_vtable_get(mrcp_message->start_line.version);
+    	mrcp_header_allocate(&properties->generic_header_accessor,pool);
+	    mrcp_header_allocate(&properties->resource_header_accessor,pool);
+#endif
+	  }
+
+		if (uni_speech->properties == NULL)
+		return -1;
+
+	  /* Check the properties set by loadgrammar */
+    if(uni_speech->properties) {
+	    apt_header_field_t *header_field;
+
+      ast_log(LOG_DEBUG, "Check grammar properties.\n");
+
+	    for(header_field = APR_RING_FIRST(&uni_speech->properties->header_section.ring);
+			  header_field != APR_RING_SENTINEL(&uni_speech->properties->header_section.ring, apt_header_field_t, link);
+				  header_field = APR_RING_NEXT(header_field, link)) {
+
+		    /* Dump the content */
+        ast_log(LOG_DEBUG, "Dump Property: %s=%s\n", header_field->name.buf, header_field->value.buf);
+
+        if (!strcmp(header_field->name.buf, grammar_path))
+			  {
+          ast_log(LOG_DEBUG, "Remove property : %s=%s\n", header_field->name.buf, header_field->value.buf);
+          apt_header_section_field_remove(&uni_speech->properties->header_section,header_field);
+			  }
+			}
+	  }
+
+
+  	/* Add properties set by loadgrammar */
+#if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
+		mrcp_header_fields_inherit(&mrcp_message->header,uni_speech->properties,mrcp_message->pool);
+#else
+		mrcp_message_header_inherit(&mrcp_message->header,uni_speech->properties,mrcp_message->pool);
+#endif
+
+#if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
+	  apt_header_field_t *header_field;
+
+    ast_log(LOG_DEBUG, "load_grammar set property %s=%s\n", grammar_path, grammar_name);
+
+  	header_field = apt_header_field_create_c(grammar_path,grammar_name, pool);
+		if(header_field) {
+			if(mrcp_header_field_add(uni_speech->properties,header_field, pool) == FALSE) {
+				ast_log(LOG_WARNING, "Unknown MRCP header %s=%s\n", grammar_path, grammar_name);
+				return -1;
+			}
+		}
+#else
+	  apt_pair_t pair;
+
+    ast_log(LOG_DEBUG, "load_grammar set property %s=%s\n", grammar_path, grammar_name);
+
+		apt_string_set(&pair.name,grammar_path);
+		apt_string_set(&pair.value,grammar_name);
+		if(mrcp_header_parse(&uni_speech->properties->resource_header_accessor,&pair, pool) != TRUE) {
+			if(mrcp_header_parse(&uni_speech->properties->generic_header_accessor,&pair, pool) != TRUE) {
+				ast_log(LOG_WARNING, "Unknown MRCP header %s=%s\n", grammar_path, grammar_name);
+				return -1;
+			}
+		}
+#endif
+
+		return 0;
 	}
 
 	if(inline_content == TRUE) {
@@ -420,7 +659,7 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 				body->buf = apr_palloc(mrcp_message->pool,finfo.size+1);
 				body->length = (apr_size_t)finfo.size;
 				if(apr_file_read(file,body->buf,&body->length) != APR_SUCCESS) {
-					ast_log(LOG_WARNING, "(%s) Failed to read grammar file %s\n",uni_speech->name,grammar_path);
+          ast_log(LOG_WARNING, "(%s) Failed to read grammar file %s\n",uni_speech->name,grammar_path);
 				}
 				body->buf[body->length] = '\0';
 			}
@@ -445,12 +684,15 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 		else if(strstr(body->buf,"#ABNF")) {
 			content_type = "application/srgs";
 		}
+    else if(!strncmp(body->buf, "SpeechWorks binary", 18)) {
+			content_type = "application/x-swi-grammar";
+    }
 		else {
 			content_type = "application/srgs+xml";
 		}
 	}
 
-	ast_log(LOG_NOTICE, "(%s) Load grammar name: %s type: %s path: %s\n",
+	ast_log(LOG_DEBUG, "(%s) Load grammar name: %s type: %s path: %s\n",
 				uni_speech->name,
 				grammar_name,
 				content_type,
@@ -465,12 +707,29 @@ static int uni_recog_load_grammar(struct ast_speech *speech, ast_compat_const ch
 		mrcp_generic_header_property_add(mrcp_message,GENERIC_HEADER_CONTENT_ID);
 	}
 
+  if (uni_engine.setspeechlanguage)
+  if (uni_speech->language[0])
+  {
+		ast_log(LOG_DEBUG, "(%s) %s: %s\n", uni_speech->name, "Speech-Language", uni_speech->language);
+		apt_header_field_t *header_field = apt_header_field_create_c("Speech-Language", uni_speech->language, mrcp_message->pool);
+		if(header_field) {
+			if(mrcp_message_header_field_add(mrcp_message, header_field) == FALSE) {
+				ast_log(LOG_WARNING, "Error setting MRCP header %s=%s\n", "Speech-Language", uni_speech->language);
+			}
+		}
+  }
+
 	/* Send MRCP request and wait for response */
 	if(uni_recog_mrcp_request_send(uni_speech,mrcp_message) != TRUE) {
 		ast_log(LOG_WARNING, "(%s) Failed to load grammar\n",uni_speech->name);
 		return -1;
 	}
 
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -480,14 +739,24 @@ static int uni_recog_unload_grammar(struct ast_speech *speech, ast_compat_const 
 	uni_speech_t *uni_speech = speech->data;
 	mrcp_message_t *mrcp_message;
 	mrcp_generic_header_t *generic_header;
+  char *binary;
 
 	if(uni_speech->is_inprogress) {
 		uni_recog_stop(speech);
 	}
 
-	ast_log(LOG_NOTICE, "(%s) Unload grammar name: %s\n",
+	ast_log(LOG_DEBUG, "(%s) Unload grammar name: %s\n",
 				uni_speech->name,
 				grammar_name);
+
+  binary = apr_hash_get(uni_speech->binary_grammars, grammar_name, APR_HASH_KEY_STRING);
+  if (binary)
+	{
+  	ast_log(LOG_DEBUG, "(%s) Unload binary grammar: %s (%s)\n",uni_speech->name,grammar_name, binary);
+
+  	apr_hash_set(uni_speech->binary_grammars,grammar_name,APR_HASH_KEY_STRING,NULL);
+    return 0;
+  }
 
 	apr_hash_set(uni_speech->active_grammars,grammar_name,APR_HASH_KEY_STRING,NULL);
 
@@ -499,11 +768,13 @@ static int uni_recog_unload_grammar(struct ast_speech *speech, ast_compat_const 
 		ast_log(LOG_WARNING, "(%s) Failed to create MRCP message\n",uni_speech->name);
 		return -1;
 	}
-
+	
 	/* Get/allocate generic header */
 	generic_header = mrcp_generic_header_prepare(mrcp_message);
 	if(generic_header) {
 		/* Set generic header fields */
+		//apt_string_assign(&generic_header->content_type,"application/srgs",mrcp_message->pool);
+		//mrcp_generic_header_property_add(mrcp_message,GENERIC_HEADER_CONTENT_TYPE);
 		apt_string_assign(&generic_header->content_id,grammar_name,mrcp_message->pool);
 		mrcp_generic_header_property_add(mrcp_message,GENERIC_HEADER_CONTENT_ID);
 	}
@@ -514,6 +785,11 @@ static int uni_recog_unload_grammar(struct ast_speech *speech, ast_compat_const 
 		return -1;
 	}
 
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return -1;
+	}
 	return 0;
 }
 
@@ -524,7 +800,30 @@ static int uni_recog_activate_grammar(struct ast_speech *speech, ast_compat_cons
 	apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
 	const char *entry;
 
-	ast_log(LOG_NOTICE, "(%s) Activate grammar name: %s\n",uni_speech->name,grammar_name);
+  // Dump binary grammars
+  if (0)
+  {
+  	apr_hash_index_t *it;
+		void *val;
+		const void *key;
+
+		/* Construct and set message body */
+		it = apr_hash_first(pool,uni_speech->binary_grammars);
+		if(it) {
+			apr_hash_this(it,&key,NULL,&val);
+
+	  	ast_log(LOG_DEBUG, "(%s) Binary grammar : %s , %s\n", uni_speech->name, (const char*)key, (char*)val);
+
+		it = apr_hash_next(it);
+		}
+		for(; it; it = apr_hash_next(it)) {
+			apr_hash_this(it,&key,NULL,&val);
+
+    	ast_log(LOG_DEBUG, "(%s) Binary grammar : %s , %s\n",uni_speech->name, (const char*)key, (char*)val);
+		}
+  }
+
+	ast_log(LOG_DEBUG, "(%s) Activate grammar name: %s\n",uni_speech->name,grammar_name);
 	entry = apr_pstrdup(pool,grammar_name);
 	apr_hash_set(uni_speech->active_grammars,entry,APR_HASH_KEY_STRING,entry);
 	return 0;
@@ -569,6 +868,23 @@ static int uni_recog_dtmf(struct ast_speech *speech, const char *dtmf)
 {
 	uni_speech_t *uni_speech = speech->data;
 	ast_log(LOG_NOTICE, "(%s) Signal DTMF %s\n",uni_speech->name,dtmf);
+
+  if (uni_speech->dtmf_generator != NULL) {
+		char digits[2];
+		digits[0] = (char)*dtmf;
+		digits[1] = '\0';
+
+		ast_log(LOG_NOTICE, "(%s) DTMF digit queued (%s)\n", uni_speech->name, digits);
+		mpf_dtmf_generator_enqueue(uni_speech->dtmf_generator, digits);
+	}
+
+	if (uni_engine.dtmfstopspeech)
+  if (uni_speech->is_inprogress)
+  {
+		ast_log(LOG_NOTICE, "(%s) DTMF stop the speech.\n", uni_speech->name);
+    uni_recog_stop(speech);
+  }
+
 	return 0;
 }
 
@@ -579,12 +895,45 @@ static int uni_recog_start(struct ast_speech *speech)
 	mrcp_message_t *mrcp_message;
 	mrcp_generic_header_t *generic_header;
 	mrcp_recog_header_t *recog_header;
+  apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
+
+  // Dump binary grammars
+  {
+  	apr_hash_index_t *it;
+		void *val;
+		const void *key;
+
+		/* Construct and set message body */
+		it = apr_hash_first(pool,uni_speech->binary_grammars);
+		if(it) {
+			apr_hash_this(it,&key,NULL,&val);
+
+	  	ast_log(LOG_DEBUG, "(%s) Binary grammar : %s , %s\n", uni_speech->name, (const char*)key, (char*)val);
+
+		it = apr_hash_next(it);
+		}
+		for(; it; it = apr_hash_next(it)) {
+			apr_hash_this(it,&key,NULL,&val);
+
+    	ast_log(LOG_DEBUG, "(%s) Binary grammar : %s , %s\n",uni_speech->name, (const char*)key, (char*)val);
+		}
+  }
 
 	if(uni_speech->is_inprogress) {
+		if (uni_engine.startinputtimers)
 		uni_recog_stop(speech);
 	}
 
-	ast_log(LOG_NOTICE, "(%s) Start recognition\n",uni_speech->name);
+  /* Set properties for session */
+	if (uni_engine.setparams)
+	uni_recog_properties_set(uni_speech);
+
+	if(uni_speech->is_inprogress) {
+		if (!uni_engine.startinputtimers)
+	  return uni_recog_start_input_timers(uni_speech);
+	}
+
+	ast_log(LOG_DEBUG, "(%s) Start recognition\n",uni_speech->name);
 	mrcp_message = mrcp_application_message_create(
 								uni_speech->session,
 								uni_speech->channel,
@@ -593,13 +942,16 @@ static int uni_recog_start(struct ast_speech *speech)
 		ast_log(LOG_WARNING, "(%s) Failed to create MRCP message\n",uni_speech->name);
 		return -1;
 	}
-
+	
 	/* Get/allocate generic header */
 	generic_header = mrcp_generic_header_prepare(mrcp_message);
 	if(generic_header) {
 		apr_hash_index_t *it;
 		void *val;
-		const char *grammar_name;
+		const void *key;
+		const void *binary;
+    const char *grammar_name;
+		const char *grammar_path;
 		const char *content = NULL;
 		/* Set generic header fields */
 		apt_string_assign(&generic_header->content_type,"text/uri-list",mrcp_message->pool);
@@ -610,13 +962,39 @@ static int uni_recog_start(struct ast_speech *speech)
 		if(it) {
 			apr_hash_this(it,NULL,NULL,&val);
 			grammar_name = val;
-			content = apr_pstrcat(mrcp_message->pool,"session:",grammar_name,NULL);
+
+      binary = apr_hash_get(uni_speech->binary_grammars, grammar_name, APR_HASH_KEY_STRING);
+      if (binary)
+      {
+        grammar_name = binary;
+    	  ast_log(LOG_DEBUG, "(%s) Active binary grammar : %s , %s\n", uni_speech->name, val, binary);
+  			content = apr_pstrcat(mrcp_message->pool,grammar_name,NULL);
+    }
+      else
+      {
+    	  ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
+  			content = apr_pstrcat(mrcp_message->pool,"session:", grammar_name,NULL);
+      }
+
 			it = apr_hash_next(it);
 		}
 		for(; it; it = apr_hash_next(it)) {
-			apr_hash_this(it,NULL,NULL,&val);
+			apr_hash_this(it,&key,NULL,&val);
 			grammar_name = val;
-			content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+
+      binary = apr_hash_get(uni_speech->binary_grammars, grammar_name, APR_HASH_KEY_STRING);
+      if (binary)
+      {
+        grammar_name = binary;
+    	  ast_log(LOG_DEBUG, "(%s) Active binary grammar : %s , %s\n", uni_speech->name, val, binary);
+  			content = apr_pstrcat(mrcp_message->pool,content,"\n",binary,NULL);
+      }
+      else
+      {
+    	  ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
+	  		content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+      }
+
 		}
 		if(content) {
 			apt_string_set(&mrcp_message->body,content);
@@ -627,28 +1005,121 @@ static int uni_recog_start(struct ast_speech *speech)
 	recog_header = (mrcp_recog_header_t*) mrcp_resource_header_prepare(mrcp_message);
 	if(recog_header) {
 		/* Set recognizer header fields */
-		if(mrcp_message->start_line.version == MRCP_VERSION_2) {
+		if(mrcp_message->start_line.version == MRCP_VERSION_2 && uni_engine.cancelifqueue) { // cancelifqueue for Vestec
 			recog_header->cancel_if_queue = FALSE;
 			mrcp_resource_header_property_add(mrcp_message,RECOGNIZER_HEADER_CANCEL_IF_QUEUE);
 		}
-		recog_header->start_input_timers = TRUE;
-		mrcp_resource_header_property_add(mrcp_message,RECOGNIZER_HEADER_START_INPUT_TIMERS);
+
+		//if (uni_engine.startinputtimers) // startinputtimers for aumtech
+		{
+		  recog_header->start_input_timers = uni_engine.startinputtimers;
+		  mrcp_resource_header_property_add(mrcp_message,RECOGNIZER_HEADER_START_INPUT_TIMERS);
+    }
 	}
+
+	/* Check the properties set by loadgrammar */
+	if(!uni_engine.setparams)
+  if(uni_speech->properties) {
+	  apt_header_field_t *header_field;
+		char value[1000];
+		char *unit;
+
+    ast_log(LOG_DEBUG, "Check grammar properties.\n");
+
+	  for(header_field = APR_RING_FIRST(&uni_speech->properties->header_section.ring);
+			header_field != APR_RING_SENTINEL(&uni_speech->properties->header_section.ring, apt_header_field_t, link);
+				header_field = APR_RING_NEXT(header_field, link)) {
+
+		  /* Dump the content */
+      ast_log(LOG_DEBUG, "Property: %s=%s\n", header_field->name.buf, header_field->value.buf);
+			if (header_field->value.buf)
+			strncpy(value, header_field->value.buf, 1000);
+			else
+			value[0]=0;
+
+      ast_log(LOG_DEBUG, "MRCP Version : %d\n", mrcp_message->start_line.version);
+
+      if (uni_engine.removeswi && !strncmp(header_field->name.buf, "swi", 3))
+			{
+        ast_log(LOG_DEBUG, "Remove Nuance property : %s=%s\n", header_field->name.buf, header_field->value);
+        apt_header_section_field_remove(&uni_speech->properties->header_section,header_field);
+			}
+			else
+			if(mrcp_message->start_line.version == MRCP_VERSION_1 && (unit = strchr(value, 's')))
+			{
+        float fvalue;
+				float factor = 1000;
+
+				if (unit>value)
+				{
+				  if (*(unit-1)=='m')
+				  {
+						unit--;
+					  factor = 1;
+					}
+				}
+				else
+				factor = 0;
+
+				*unit = 0;
+
+				fvalue = atof(value);
+				fvalue = fvalue*factor;
+
+        sprintf(value, "%d", (int)fvalue);
+
+        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+			}
+			else
+      if(mrcp_message->start_line.version == MRCP_VERSION_1 && (value[1]=='.' && (value[0]=='0' || value[0]=='1')))
+			{
+        float fvalue = atof(value);
+				fvalue = fvalue*100;
+
+        sprintf(value, "%d", (int)fvalue);
+
+        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+			}
+
+	  }
+
+  	/* Add properties set by loadgrammar */
+#if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
+		mrcp_header_fields_inherit(&mrcp_message->header,uni_speech->properties,mrcp_message->pool);
+#else
+		mrcp_message_header_inherit(&mrcp_message->header,uni_speech->properties,mrcp_message->pool);
+#endif
+  }
+
+
+
 
 	/* Reset last event (if any) */
 	uni_speech->mrcp_event = NULL;
 
 	/* Send MRCP request and wait for response */
 	if(uni_recog_mrcp_request_send(uni_speech,mrcp_message) != TRUE) {
-		ast_log(LOG_WARNING, "(%s) Failed to start recognition\n",uni_speech->name);
+    ast_log(LOG_WARNING, "(%s) Failed to start recognition\n",uni_speech->name);
 		return -1;
 	}
 
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return -1;
+	}
+	
 	/* Reset media buffer */
 	mpf_frame_buffer_restart(uni_speech->media_buffer);
-
+	
 	ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
-
+	
 	uni_speech->is_inprogress = TRUE;
 	return 0;
 }
@@ -690,6 +1161,70 @@ static int uni_recog_change_results_type(struct ast_speech *speech,enum ast_spee
 	return -1;
 }
 
+
+/* Start duplicated code to patch apt_nlsml_doc for Nuance */
+
+/** NLSML instance */
+struct nlsml_instance_t
+{
+	/** Ring entry */
+	APR_RING_ENTRY(nlsml_instance_t) link;
+
+	/** Instance element */
+	apr_xml_elem *elem;
+};
+
+/** Suppress SWI elements (normalize instance) */
+APT_DECLARE(apt_bool_t) nlsml_instance_swi_suppress2(nlsml_instance_t *instance)
+{
+	apr_xml_elem *child_elem;
+	apr_xml_elem *prev_elem = NULL;
+	apr_xml_elem *swi_literal = NULL;
+	apr_xml_elem *swi_meaning = NULL;
+	apr_xml_elem *swi_grammarname = NULL;
+	apt_bool_t remove;
+	if(!instance->elem)
+		return FALSE;
+
+	for(child_elem = instance->elem->first_child; child_elem; child_elem = child_elem->next) {
+		remove = FALSE;
+		if(strcasecmp(child_elem->name,"SWI_literal") == 0) {
+			swi_literal = child_elem;
+			remove = TRUE;
+		}
+		else if(strcasecmp(child_elem->name,"SWI_meaning") == 0) {
+			swi_meaning = child_elem;
+			remove = TRUE;
+		}
+		else if(strcasecmp(child_elem->name,"SWI_grammarName") == 0) {
+			swi_grammarname = child_elem;
+			remove = TRUE;
+		}
+
+		if(remove == TRUE) {
+    	ast_log(LOG_NOTICE, "nlsml_instance_swi_suppress2: remove %s\n", child_elem->name);
+
+			if(child_elem == instance->elem->first_child) {
+				instance->elem->first_child = child_elem->next;
+			}
+			else if(prev_elem) {
+				prev_elem->next = child_elem->next;
+			}
+		}
+
+		prev_elem = child_elem;
+	}
+
+	if(APR_XML_ELEM_IS_EMPTY(instance->elem) && swi_literal) {
+ 		ast_log(LOG_NOTICE, "nlsml_instance_swi_suppress2: Instance empty, get the SWI_literal CDATA\n");
+		instance->elem->first_cdata = swi_literal->first_cdata;
+	}
+
+	return TRUE;
+}
+
+/* End of duplication */
+
 /** \brief Build ast_speech_result based on the NLSML result */
 static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni_speech, const apt_str_t *nlsml_result, mrcp_version_e mrcp_version)
 {
@@ -703,12 +1238,43 @@ static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni
 	nlsml_input_t *input;
 	int interpretation_count;
 	int instance_count;
+	char filename[100]="/tmp/unimrcp.xml";
+  FILE *file;
 
 	apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
+
+	if (uni_engine.returnnlsml)
+	{
+		sprintf(filename, "/tmp/%s.xml", uni_speech->name);
+
+    file = fopen(filename, "wb");
+    if (file != NULL)
+		{
+      fwrite(nlsml_result->buf, 1, nlsml_result->length, file);
+
+			fclose(file);
+		}
+	}
+
 	nlsml_result_t *result = nlsml_result_parse(nlsml_result->buf, nlsml_result->length, pool);
 	if(!result) {
 		ast_log(LOG_WARNING, "(%s) Failed to parse NLSML result: %s\n",uni_speech->name,nlsml_result->buf);
 		return NULL;
+	}
+
+	if (!uni_engine.returnnlsml)
+	{
+	  // Nuance needs to execute our function first to remove SWI_grammarName
+	  interpretation = nlsml_first_interpretation_get(result);
+	  while(interpretation) {
+		  input = nlsml_interpretation_input_get(interpretation);
+		  instance = nlsml_interpretation_first_instance_get(interpretation);
+		  while(instance) {
+			  nlsml_instance_swi_suppress2(instance);
+			  instance = nlsml_interpretation_next_instance_get(interpretation, instance);
+		  }
+      interpretation = nlsml_next_interpretation_get(result, interpretation);
+	  }
 	}
 
 #if 1 /* enable/disable debug output of parsed results */
@@ -728,16 +1294,31 @@ static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni
 	while(interpretation) {
 		input = nlsml_interpretation_input_get(interpretation);
 		if(!input) {
-			ast_log(LOG_WARNING, "(%s) Failed to get NLSML input\n",uni_speech->name);
+			ast_log(LOG_WARNING, "(%s) Failed to get NLSML input.\n",uni_speech->name);
 			continue;
 		}
 
 		instance_count = 0;
 		instance = nlsml_interpretation_first_instance_get(interpretation);
 		if(!instance) {
-			ast_log(LOG_WARNING, "(%s) Failed to get NLSML instance\n",uni_speech->name);
-			continue;
+			ast_log(LOG_DEBUG, "(%s) Failed to get NLSML instance, using input.\n",uni_speech->name);
+			//continue;
 		}
+
+  	/* Only for future debug
+	  {
+	  apr_xml_elem *child_elem;
+	  const apr_xml_attr *xml_attr;
+	  for(child_elem = interpret->first_child; child_elem; child_elem = child_elem->next) {
+		  ast_log(LOG_WARNING, "PARSING Child interpreter '%s'\n", child_elem->name);
+	  }
+
+	  for(xml_attr = interpret->attr; xml_attr; xml_attr = xml_attr->next) {
+		ast_log(LOG_WARNING, "PARSING Attr interpreter '%s'\n", xml_attr->name);
+	  }
+	  }
+	  */
+
 
 		confidence = nlsml_interpretation_confidence_get(interpretation);
 		grammar = nlsml_interpretation_grammar_get(interpretation);
@@ -751,12 +1332,39 @@ static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni
 		}
 
 		do {
-			nlsml_instance_swi_suppress(instance);
-			text = nlsml_instance_content_generate(instance, pool);
+			// Nuance needs to remove SWI_grammarName too
+			if (instance)
+			{
+			  nlsml_instance_swi_suppress2(instance);
+			  text = nlsml_instance_content_generate(instance, pool);
+
+				if (text)
+        ast_log(LOG_DEBUG, "(%s) text=%s, using instance.\n",uni_speech->name, text);
+			}
+			else
+			text = NULL;
+
+			// Nuance Instance can be empty if without SWI
+			if ((!text) || !(*text))
+			{
+			  text = nlsml_input_content_generate(input,pool);
+				if (text)
+        ast_log(LOG_DEBUG, "(%s) text=%s, using input.\n",uni_speech->name, text);
+			}
 
 			speech_result = ast_calloc(sizeof(struct ast_speech_result), 1);
+
+
+			if (uni_engine.returnnlsml)
+			{
+				speech_result->text = strdup(filename);
+			}
+			else
 			if(text)
 				speech_result->text = strdup(text);
+
+
+
 			speech_result->score = confidence * 100;
 			if(grammar)
 				speech_result->grammar = strdup(grammar);
@@ -769,7 +1377,7 @@ static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni
 			speech_result->next = last_speech_result;
 			last_speech_result = speech_result;
 #endif
-			ast_log(LOG_NOTICE, "(%s) Speech result[%d/%d]: %s, score: %d, grammar: %s\n",
+			ast_log(LOG_DEBUG, "(%s) Speech result[%d/%d]: %s, score: %d, grammar: %s\n",
 					uni_speech->name,
 					interpretation_count,
 					instance_count,
@@ -778,11 +1386,20 @@ static struct ast_speech_result* uni_recog_speech_result_build(uni_speech_t *uni
 					speech_result->grammar);
 
 			instance_count++;
+
+			if (uni_engine.returnnlsml)
+			instance=NULL;
+			else
+      if (instance)
 			instance = nlsml_interpretation_next_instance_get(interpretation, instance);
 		}
 		while(instance);
 
 		interpretation_count++;
+
+		if (uni_engine.returnnlsml)
+    interpretation = NULL;
+		else
 		interpretation = nlsml_next_interpretation_get(result, interpretation);
 	}
 
@@ -797,10 +1414,19 @@ struct ast_speech_result* uni_recog_get(struct ast_speech *speech)
 
 	uni_speech_t *uni_speech = speech->data;
 
-	if(uni_speech->is_inprogress) {
-		uni_recog_stop(speech);
+	if (uni_speech->properties)
+	{
+    mrcp_message_header_destroy(uni_speech->properties);
+    uni_speech->properties = NULL;
 	}
 
+	if(uni_speech->is_inprogress) {
+		uni_recog_stop(speech);
+    ast_log(LOG_DEBUG, "RECOGNITION stopped\n");
+		return NULL;
+	}
+
+	ast_log(LOG_DEBUG, "Get result '%s'\n",uni_speech->name);
 	if(!uni_speech->mrcp_event) {
 		ast_log(LOG_WARNING, "(%s) No RECOGNITION-COMPLETE message received\n",uni_speech->name);
 		return NULL;
@@ -813,17 +1439,60 @@ struct ast_speech_result* uni_recog_get(struct ast_speech *speech)
 		return NULL;
 	}
 
-	ast_log(LOG_NOTICE, "(%s) Get result completion cause: %03d reason: %s\n",
+	if(speech->results) {
+		ast_speech_results_free(speech->results);
+    speech->results = NULL;
+	}
+
+	ast_log(LOG_DEBUG, "(%s) Get result completion cause: %03d reason: %s\n",
 			uni_speech->name,
 			recog_header->completion_cause,
 			recog_header->completion_reason.buf ? recog_header->completion_reason.buf : "none");
 
 	if(recog_header->completion_cause != RECOGNIZER_COMPLETION_CAUSE_SUCCESS) {
-		ast_log(LOG_WARNING, "(%s) Recognition completed abnormally cause: %03d reason: %s\n",
+		result = NULL;
+
+		if (recog_header->completion_cause == 1) // nomatch
+		{
+	    ast_log(LOG_DEBUG, "(%s) Set empty result for nomatch\n", uni_speech->name);
+
+      struct ast_speech_result *speech_result;
+			speech_result	= ast_calloc(sizeof(struct ast_speech_result), 1);
+
+#if AST_VERSION_AT_LEAST(1,6,0)
+	AST_LIST_HEAD_NOLOCK(, ast_speech_result) speech_results;
+	AST_LIST_HEAD_INIT_NOLOCK(&speech_results);
+#else
+#endif
+
+			speech_result->text = strdup("");
+			speech_result->score = 0;
+
+			speech_result->grammar = NULL;
+			speech_result->nbest_num = 0;
+#if AST_VERSION_AT_LEAST(1,6,0)
+			AST_LIST_INSERT_TAIL(&speech_results, speech_result, list);
+#else
+			speech_result->next = NULL;
+#endif
+
+			result = speech_result;
+    }
+		else
+		if (recog_header->completion_cause == 2) // noinput
+		{
+	    ast_log(LOG_DEBUG, "(%s) Set null result for noinput\n", uni_speech->name);
+		}
+		else
+		{
+    		ast_log(LOG_WARNING, "(%s) Recognition completed abnormally cause: %03d reason: %s\n",
 				uni_speech->name,
 				recog_header->completion_cause,
 				recog_header->completion_reason.buf ? recog_header->completion_reason.buf : "none");
-		return NULL;
+        return NULL;
+		}
+
+		return result;
 	}
 
 	result = uni_recog_speech_result_build(
@@ -840,6 +1509,9 @@ struct ast_speech_result* uni_recog_get(struct ast_speech *speech)
 /*! \brief Signal session management response */
 static apt_bool_t uni_recog_sm_response_signal(uni_speech_t *uni_speech, mrcp_sig_command_e request, mrcp_sig_status_code_e status)
 {
+	if (!uni_speech->mutex)
+	return FALSE;
+
 	apr_thread_mutex_lock(uni_speech->mutex);
 
 	if(uni_speech->sm_request == request) {
@@ -860,6 +1532,9 @@ static apt_bool_t uni_recog_sm_response_signal(uni_speech_t *uni_speech, mrcp_si
 /*! \brief Signal MRCP response */
 static apt_bool_t uni_recog_mrcp_response_signal(uni_speech_t *uni_speech, mrcp_message_t *message)
 {
+	if (!uni_speech->mutex)
+	return FALSE;
+
 	apr_thread_mutex_lock(uni_speech->mutex);
 
 	if(uni_speech->mrcp_request) {
@@ -888,16 +1563,71 @@ static apt_bool_t on_session_update(mrcp_application_t *application, mrcp_sessio
 static apt_bool_t on_session_terminate(mrcp_application_t *application, mrcp_session_t *session, mrcp_sig_status_code_e status)
 {
 	struct ast_speech *speech = mrcp_application_session_object_get(session);
+
+	{
+    if(uni_engine.mutex) apr_thread_mutex_lock(uni_engine.mutex);
+    uni_engine.current_speech_sessions--;
+
+		ast_log(LOG_DEBUG, "Speech sessions :%d/%d\n",
+		 uni_engine.current_speech_sessions,
+		 uni_engine.max_speech_sessions);
+
+	  if(uni_engine.mutex) apr_thread_mutex_unlock(uni_engine.mutex);
+
+	  if (!speech)
+		{
+    	ast_log(LOG_DEBUG, "(%s) Session terminated status: %d\n","unref", status);
+
+    	ast_log(LOG_DEBUG, "Destroy application session\n");
+		  mrcp_application_session_destroy(session);
+	    return FALSE;
+		}
+	}
+
 	uni_speech_t *uni_speech = speech->data;
 
+	if (!uni_speech)
+	return FALSE;
+
+  uni_speech->speech_base = NULL;
+
+  if (uni_speech->dtmf_generator != NULL) {
+		ast_log(LOG_DEBUG, "(%s) DTMF generator destroyed\n", uni_speech->name);
+		mpf_dtmf_generator_destroy(uni_speech->dtmf_generator);
+		uni_speech->dtmf_generator = NULL;
+	}
+
 	ast_log(LOG_DEBUG, "(%s) Session terminated status: %d\n",uni_speech->name, status);
-	return uni_recog_sm_response_signal(uni_speech,MRCP_SIG_COMMAND_SESSION_TERMINATE,status);
+	if (uni_recog_sm_response_signal(uni_speech,MRCP_SIG_COMMAND_SESSION_TERMINATE,status))
+	{
+		return TRUE;
+	}
+	else
+	{
+  	//ast_log(LOG_DEBUG, "(%s) Destroy application session : %d\n",uni_speech->name);
+		//mrcp_application_session_destroy(session);
+
+		return FALSE;
+	}
 }
 
 /** \brief Received channel add response */
 static apt_bool_t on_channel_add(mrcp_application_t *application, mrcp_session_t *session, mrcp_channel_t *channel, mrcp_sig_status_code_e status)
 {
 	uni_speech_t *uni_speech = mrcp_application_channel_object_get(channel);
+  apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
+
+  //if (0)
+  if (uni_speech->stream != NULL)
+  if (uni_speech->dtmf_generator == NULL)
+  {
+				uni_speech->dtmf_generator = mpf_dtmf_generator_create(uni_speech->stream, pool);
+
+				if (uni_speech->dtmf_generator != NULL)
+					ast_log(LOG_DEBUG, "(%s) DTMF generator created\n", uni_speech->name);
+				else
+					ast_log(LOG_WARNING, "(%s) Unable to create DTMF generator\n", uni_speech->name);
+	}
 
 	ast_log(LOG_DEBUG, "(%s) Channel added status: %d\n",uni_speech->name, status);
 	return uni_recog_sm_response_signal(uni_speech,MRCP_SIG_COMMAND_CHANNEL_ADD,status);
@@ -917,12 +1647,20 @@ static apt_bool_t on_message_receive(mrcp_application_t *application, mrcp_sessi
 {
 	uni_speech_t *uni_speech = mrcp_application_channel_object_get(channel);
 
+	if (!uni_speech->speech_base)
+	return FALSE;
+
 	if(message->start_line.message_type == MRCP_MESSAGE_TYPE_RESPONSE) {
 		ast_log(LOG_DEBUG, "(%s) Received MRCP response method-id: %d status-code: %d req-state: %d\n",
 				uni_speech->name,
 				(int)message->start_line.method_id,
 				message->start_line.status_code,
 				(int)message->start_line.request_state);
+	
+    if(message->start_line.method_id == RECOGNIZER_STOP) {  // Correction for Aumtech
+	    ast_speech_change_state(
+		    uni_speech->speech_base,AST_SPEECH_STATE_DONE);
+    }
 		return uni_recog_mrcp_response_signal(uni_speech,message);
 	}
 
@@ -937,7 +1675,11 @@ static apt_bool_t on_message_receive(mrcp_application_t *application, mrcp_sessi
 				ast_speech_change_state(uni_speech->speech_base,AST_SPEECH_STATE_DONE);
 			}
 			else {
-				ast_log(LOG_DEBUG, "(%s) Unexpected RECOGNITION-COMPLETE event\n",uni_speech->name);
+			        ast_log(LOG_DEBUG, "(%s) Unexpected RECOGNITION-COMPLETE event\n",uni_speech->name);
+			        
+				uni_speech->mrcp_event = NULL;
+				ast_speech_change_state(uni_speech->speech_base,AST_SPEECH_STATE_NOT_READY);
+				
 			}
 		}
 		else if(message->start_line.method_id == RECOGNIZER_START_OF_INPUT) {
@@ -959,7 +1701,10 @@ static apt_bool_t on_message_receive(mrcp_application_t *application, mrcp_sessi
 static apt_bool_t on_terminate_event(mrcp_application_t *application, mrcp_session_t *session, mrcp_channel_t *channel)
 {
 	uni_speech_t *uni_speech = mrcp_application_channel_object_get(channel);
+	if (uni_speech)
 	ast_log(LOG_WARNING, "(%s) Received unexpected session termination event\n",uni_speech->name);
+	else
+	ast_log(LOG_WARNING, "(?) Received unexpected session termination event\n");
 	return TRUE;
 }
 
@@ -985,10 +1730,36 @@ static apt_bool_t uni_message_handler(const mrcp_app_message_t *app_message)
 	return mrcp_application_message_dispatch(&uni_dispatcher,app_message);
 }
 
+/** \brief UniMRCP callback requesting stream to be opened. */
+static apt_bool_t uni_recog_stream_open(mpf_audio_stream_t* stream, mpf_codec_t *codec)
+{
+	uni_speech_t* uni_speech;
+
+	if (stream != NULL)
+		uni_speech = (uni_speech_t*)stream->obj;
+	else
+		uni_speech = NULL;
+
+	uni_speech->stream = stream;
+
+	if ((uni_speech == NULL) || (stream == NULL))
+		ast_log(LOG_ERROR, "(unknown) channel error opening stream!\n");
+
+	return TRUE;
+}
+
 /** \brief Process MPF frame */
 static apt_bool_t uni_recog_stream_read(mpf_audio_stream_t *stream, mpf_frame_t *frame)
 {
 	uni_speech_t *uni_speech = stream->obj;
+
+	if (uni_speech->dtmf_generator != NULL) {
+			if (mpf_dtmf_generator_sending(uni_speech->dtmf_generator)) {
+				ast_log(LOG_DEBUG, "(%s) DTMF frame written\n", uni_speech->name);
+				mpf_dtmf_generator_put_frame(uni_speech->dtmf_generator, frame);
+				return TRUE;
+			}
+	}
 
 	if(uni_speech->media_buffer) {
 		mpf_frame_buffer_read(uni_speech->media_buffer,frame);
@@ -1005,7 +1776,7 @@ static apt_bool_t uni_recog_stream_read(mpf_audio_stream_t *stream, mpf_frame_t 
 /** \brief Methods of audio stream */
 static const mpf_audio_stream_vtable_t audio_stream_vtable = {
 	NULL,
-	NULL,
+	uni_recog_stream_open,
 	NULL,
 	uni_recog_stream_read,
 	NULL,
@@ -1054,8 +1825,14 @@ static apt_bool_t uni_recog_channel_create(uni_speech_t *uni_speech, ast_format_
 /** \brief Set properties */
 static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 {
+	apr_pool_t *pool = mrcp_application_session_pool_get(uni_speech->session);
 	mrcp_message_t *mrcp_message;
 	mrcp_message_header_t *properties;
+
+  char vendorparameters[1000];
+
+  vendorparameters[0]=0;
+
 	ast_log(LOG_DEBUG, "(%s) Set properties\n",uni_speech->name);
 	mrcp_message = mrcp_application_message_create(
 								uni_speech->session,
@@ -1074,6 +1851,93 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 		properties = uni_engine.v1_properties;
 	}
 
+	/* Check the properties set by loadgrammar */
+  if(uni_speech->properties) {
+	  apt_header_field_t *header_field;
+		char value[1000];
+		char *unit;
+
+    vendorparameters[0]=0;
+    properties = NULL;
+
+    ast_log(LOG_DEBUG, "Check grammar properties.\n");
+
+    ast_log(LOG_DEBUG, "MRCP Version : %d\n", mrcp_message->start_line.version);
+
+	  for(header_field = APR_RING_FIRST(&uni_speech->properties->header_section.ring);
+			header_field != APR_RING_SENTINEL(&uni_speech->properties->header_section.ring, apt_header_field_t, link);
+				header_field = APR_RING_NEXT(header_field, link)) {
+
+		  /* Dump the content */
+      ast_log(LOG_DEBUG, "Property: %s=%s\n", header_field->name.buf, header_field->value.buf);
+			if (header_field->value.buf)
+			strncpy(value, header_field->value.buf, 1000);
+			else
+			value[0]=0;
+
+      if (uni_engine.removeswi && !strncmp(header_field->name.buf, "swi", 3))
+			{
+        ast_log(LOG_DEBUG, "Remove Nuance property : %s=%s\n", header_field->name.buf, header_field->value);
+
+				if (vendorparameters[0])
+				strcat(vendorparameters, ";");
+
+				if (!apt_string_is_empty(&header_field->value))
+				sprintf(value, "%s=\"%s\"", header_field->name.buf, header_field->value);
+				else
+				sprintf(value, "%s=\"\"", header_field->name.buf);
+
+				if (uni_engine.vendorspecificparameters)
+				strcat(vendorparameters, value);
+
+        apt_header_section_field_remove(&uni_speech->properties->header_section,header_field);
+			}
+			else
+			if(mrcp_message->start_line.version == MRCP_VERSION_1 && (unit = strchr(value, 's')))
+			{
+        float fvalue;
+				float factor = 1000;
+
+				if (unit>value)
+				{
+				  if (*(unit-1)=='m')
+				  {
+						unit--;
+					  factor = 1;
+					}
+				}
+				else
+				factor = 0;
+
+				*unit = 0;
+
+				fvalue = atof(value);
+				fvalue = fvalue*factor;
+
+        sprintf(value, "%d", (int)fvalue);
+
+        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+			}
+			else
+      if(mrcp_message->start_line.version == MRCP_VERSION_1 && (value[1]=='.' && (value[0]=='0' || value[0]=='1')))
+			{
+        float fvalue = atof(value);
+				fvalue = fvalue*100;
+
+        sprintf(value, "%d", (int)fvalue);
+
+        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+			}
+
+	  }
+	}
+
 	if(properties) {
 #if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
 		mrcp_header_fields_inherit(&mrcp_message->header,properties,mrcp_message->pool);
@@ -1082,12 +1946,77 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 #endif
 	}
 
+  properties = uni_speech->properties;
+  if (properties) {
+#if defined(TRANSPARENT_HEADER_FIELDS_SUPPORT)
+		mrcp_header_fields_inherit(&mrcp_message->header,properties,mrcp_message->pool);
+#else
+		mrcp_message_header_inherit(&mrcp_message->header,properties,mrcp_message->pool);
+#endif
+	}
+
+  /* Add properties set by loadgrammar (Vendor-Specific-Parameters) */
+	if (vendorparameters[0])
+	{
+  	apt_header_field_t *header_field;
+
+    ast_log(LOG_DEBUG, "Set Vendor-Specific-Parameters : %s\n", vendorparameters);
+
+  	header_field = apt_header_field_create_c("Vendor-Specific-Parameters",vendorparameters, pool);
+		apt_header_section_field_add(&mrcp_message->header.header_section,header_field);
+ 	}
+
 	/* Send MRCP request and wait for response */
 	if(uni_recog_mrcp_request_send(uni_speech,mrcp_message) != TRUE) {
-		ast_log(LOG_WARNING, "(%s) Failed to set properties\n",uni_speech->name);
+    ast_log(LOG_WARNING, "(%s) Failed to set properties\n",uni_speech->name);
 		return FALSE;
 	}
 
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return FALSE;
+	}
+	return TRUE;
+}
+
+
+/** \brief Start Input Timers */
+static apt_bool_t uni_recog_start_input_timers(uni_speech_t *uni_speech)
+{
+	mrcp_message_t *mrcp_message;
+	mrcp_message_header_t *properties;
+
+
+	ast_log(LOG_DEBUG, "(%s) Start Input Timers\n",uni_speech->name);
+	mrcp_message = mrcp_application_message_create(
+								uni_speech->session,
+								uni_speech->channel,
+								RECOGNIZER_START_INPUT_TIMERS);
+	if(!mrcp_message) {
+		ast_log(LOG_WARNING, "(%s) Failed to create MRCP message\n",uni_speech->name);
+		return FALSE;
+	}
+
+	/* Inherit properties loaded from config */
+	if(mrcp_message->start_line.version == MRCP_VERSION_2) {
+		properties = uni_engine.v2_properties;
+	}
+	else {
+		properties = uni_engine.v1_properties;
+	}
+
+	/* Send MRCP request and wait for response */
+	if(uni_recog_mrcp_request_send(uni_speech,mrcp_message) != TRUE) {
+    ast_log(LOG_WARNING, "(%s) Failed to set properties\n",uni_speech->name);
+		return FALSE;
+	}
+
+	/* Check received response */
+	if(!uni_speech->mrcp_response || uni_speech->mrcp_response->start_line.status_code != MRCP_STATUS_CODE_SUCCESS) {
+		ast_log(LOG_WARNING, "Received failure response\n");
+		return FALSE;
+	}
 	return TRUE;
 }
 
@@ -1287,6 +2216,23 @@ static apt_bool_t uni_engine_config_load(apr_pool_t *pool)
 #else
 	struct ast_config *cfg = ast_config_load(UNI_ENGINE_CONFIG);
 #endif
+
+#if AST_VERSION_AT_LEAST(1,6,0)
+	if (!cfg)
+	cfg = ast_config_load("unimrcp.conf", config_flags);
+	if (!cfg)
+	cfg = ast_config_load("res_speech_unimrcp.conf", config_flags);
+	if (!cfg)
+	cfg = ast_config_load(UNI_ENGINE_CONFIG, config_flags);
+#else
+	if (!cfg)
+	cfg = ast_config_load("unimrcp.conf");
+	if (!cfg)
+	cfg = ast_config_load("res_speech_unimrcp.conf");
+	if (!cfg)
+	cfg = ast_config_load(UNI_ENGINE_CONFIG);
+#endif
+
 	if(!cfg) {
 		ast_log(LOG_WARNING, "No such configuration file %s\n", UNI_ENGINE_CONFIG);
 		return FALSE;
@@ -1313,6 +2259,75 @@ static apt_bool_t uni_engine_config_load(apr_pool_t *pool)
 		uni_engine.log_output = atoi(value);
 	}
 
+	if((value = ast_variable_retrieve(cfg, "general", "cancelifqueue")) != NULL) {
+		ast_log(LOG_DEBUG, "general.cancelifqueue=%s\n", value);
+		uni_engine.cancelifqueue = ast_true(value);
+	}
+  else
+	uni_engine.cancelifqueue = TRUE;
+
+	if((value = ast_variable_retrieve(cfg, "general", "startinputtimers")) != NULL) {
+		ast_log(LOG_DEBUG, "general.startinputtimers=%s\n", value);
+		uni_engine.startinputtimers = ast_true(value);
+	}
+	else
+	uni_engine.startinputtimers = TRUE;
+
+	if((value = ast_variable_retrieve(cfg, "general", "dtmfstopspeech")) != NULL) {
+		ast_log(LOG_DEBUG, "general.dtmfstopspeech=%s\n", value);
+		uni_engine.dtmfstopspeech = ast_true(value);
+	}
+	else
+	uni_engine.dtmfstopspeech = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "returnnlsml")) != NULL) {
+		ast_log(LOG_DEBUG, "general.returnnlsml=%s\n", value);
+		uni_engine.returnnlsml = ast_true(value);
+	}
+	else
+	uni_engine.returnnlsml = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "vendorspecificparameters")) != NULL) {
+		ast_log(LOG_DEBUG, "general.vendorspecificparameters=%s\n", value);
+		uni_engine.vendorspecificparameters = ast_true(value);
+	}
+  else
+	uni_engine.vendorspecificparameters = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "setparams")) != NULL) {
+		ast_log(LOG_DEBUG, "general.setparams=%s\n", value);
+		uni_engine.setparams = ast_true(value);
+	}
+  else
+	uni_engine.setparams = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "removeswi")) != NULL) {
+		ast_log(LOG_DEBUG, "general.removeswi=%s\n", value);
+		uni_engine.removeswi = ast_true(value);
+	}
+  else
+	uni_engine.removeswi = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "setspeechlanguage")) != NULL) {
+		ast_log(LOG_DEBUG, "general.setspeechlanguage=%s\n", value);
+		uni_engine.setspeechlanguage = ast_true(value);
+	}
+  else
+	uni_engine.setspeechlanguage = FALSE;
+
+  if((value = ast_variable_retrieve(cfg, "general", "max")) != NULL) {
+		ast_log(LOG_DEBUG, "general.max=%s\n", value);
+		uni_engine.max_speech_sessions = atoi(value);
+	}
+
+  if((value = ast_variable_retrieve(cfg, "general", "binarygrammars")) != NULL) {
+		ast_log(LOG_DEBUG, "general.binarygrammars=%s\n", value);
+		uni_engine.binarygrammars = ast_true(value);
+	}
+  else
+	uni_engine.binarygrammars = FALSE;
+
+
 	uni_engine.grammars = uni_engine_grammars_load(cfg,"grammars",pool);
 
 	uni_engine.v2_properties = uni_engine_properties_load(cfg,"mrcpv2-properties",MRCP_VERSION_2,pool);
@@ -1326,6 +2341,7 @@ static apt_bool_t uni_engine_config_load(apr_pool_t *pool)
 static apt_bool_t uni_engine_unload()
 {
 	if(uni_engine.client) {
+    mrcp_client_shutdown(uni_engine.client);
 		mrcp_client_destroy(uni_engine.client);
 		uni_engine.client = NULL;
 	}
@@ -1343,8 +2359,9 @@ static apt_bool_t uni_engine_unload()
 		uni_engine.pool = NULL;
 	}
 
-	/* APR global termination */
+ 	/* APR global termination */
 	apr_terminate();
+
 	return TRUE;
 }
 
@@ -1371,6 +2388,18 @@ static apt_bool_t uni_engine_load()
 	uni_engine.v1_properties = NULL;
 	uni_engine.mutex = NULL;
 	uni_engine.current_speech_index = 0;
+	uni_engine.current_speech_sessions = 0;
+	uni_engine.max_speech_sessions = 240;
+
+  uni_engine.cancelifqueue = TRUE; // option for Vestec
+  uni_engine.startinputtimers = TRUE;
+  uni_engine.dtmfstopspeech = FALSE;
+  uni_engine.returnnlsml = FALSE; // Pass NLSML XML file tmp reference as result
+  uni_engine.vendorspecificparameters = FALSE; // option for Nuance
+  uni_engine.setparams = FALSE; // option for Nuance
+  uni_engine.removeswi = FALSE; // option for Nuance
+  uni_engine.setspeechlanguage = FALSE;
+  uni_engine.binarygrammars = FALSE; // option for Nuance
 
 	pool = apt_pool_create();
 	if(!pool) {
@@ -1380,12 +2409,15 @@ static apt_bool_t uni_engine_load()
 	}
 
 	uni_engine.pool = pool;
-
+	uni_engine.v2_properties = NULL;
+	uni_engine.v1_properties = NULL;
+			
 	if(apr_thread_mutex_create(&uni_engine.mutex, APR_THREAD_MUTEX_DEFAULT, pool) != APR_SUCCESS) {
 		ast_log(LOG_ERROR, "Failed to create engine mutex\n");
 		uni_engine_unload();
 		return FALSE;
 	}
+
 
 	/* Load engine configuration */
 	uni_engine_config_load(pool);
@@ -1403,9 +2435,9 @@ static apt_bool_t uni_engine_load()
 #else
 		const char *log_dir_path = dir_layout->log_dir_path;
 #endif
-		/* Open the log file */
+	  /* Open the log file */
 		apt_log_file_open(log_dir_path,"astuni",MAX_LOG_FILE_SIZE,MAX_LOG_FILE_COUNT,TRUE,pool);
-	}
+  }
 
 	uni_engine.client = unimrcp_client_create(dir_layout);
 	if(uni_engine.client) {
@@ -1478,6 +2510,58 @@ static int load_module(void)
 		return AST_MODULE_LOAD_FAILURE;
 	}
 
+  if (strchr(uni_engine.profile, ','))
+  {
+    char configured_profile[255] = "";
+    char *profile = NULL;
+    char *profile_end = NULL;
+    struct ast_speech_engine *ast_engine_profile;
+    char *name;
+
+    strncpy(configured_profile, uni_engine.profile, sizeof(configured_profile));
+    profile = configured_profile;
+
+    do
+    {
+      profile_end = strchr(profile, ',');
+      if (profile_end)
+      {
+        *profile_end = 0;
+      }
+
+  	  ast_log(LOG_NOTICE, "Profile = %s\n", profile);
+
+      ast_engine_profile = ast_calloc(sizeof(struct ast_speech_engine), 1);
+      if (ast_engine_profile)
+      {
+        memcpy(ast_engine_profile, &ast_engine, sizeof(struct ast_speech_engine));
+
+        name = apr_palloc(uni_engine.pool,100);
+        if (name)
+        {
+          sprintf(name, "%s:%s", UNI_ENGINE_NAME, profile);
+          ast_engine_profile->name = name;
+	        if(ast_speech_register(ast_engine_profile)) {
+		        ast_log(LOG_ERROR, "Failed to register module %s\n", name);
+            ast_free(name);
+            ast_free(ast_engine_profile);
+		      }
+        }
+        else
+        {
+		      ast_log(LOG_ERROR, "Failed to register module %s\n", name);
+          ast_free(ast_engine_profile);
+        }
+	    }
+
+      if (profile_end)
+      profile_end++;
+
+      profile = profile_end;
+    }
+    while (profile_end);
+  }
+
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
@@ -1489,12 +2573,62 @@ static int unload_module(void)
 		ast_log(LOG_ERROR, "Failed to unregister module\n");
 	}
 
+  if (strchr(uni_engine.profile, ','))
+  {
+    char configured_profile[255] = "";
+    char *profile = NULL;
+    char *profile_end = NULL;
+    char *name;
+
+    strncpy(configured_profile, uni_engine.profile, sizeof(configured_profile));
+    profile = configured_profile;
+
+    do
+    {
+      profile_end = strchr(profile, ',');
+      if (profile_end)
+      {
+        *profile_end = 0;
+      }
+
+  	  ast_log(LOG_NOTICE, "Profile = %s\n", profile);
+
+      name = ast_calloc(100, 1);
+      if (name)
+      {
+        sprintf(name, "%s:%s", UNI_ENGINE_NAME, profile);
+	      if(ast_speech_unregister(name)) {
+		      ast_log(LOG_ERROR, "Failed to unregister module %s\n", name);
+	      }
+        ast_free(name);
+	    }
+
+      if (profile_end)
+      profile_end++;
+
+      profile = profile_end;
+    }
+    while (profile_end);
+  }
+
 	if(uni_engine.client) {
 		mrcp_client_shutdown(uni_engine.client);
+	}
+
+	if(uni_engine.v1_properties) {
+    mrcp_message_header_destroy(uni_engine.v1_properties);
+	}
+
+  if(uni_engine.v2_properties){
+    mrcp_message_header_destroy(uni_engine.v2_properties);
 	}
 
 	uni_engine_unload();
 	return 0;
 }
+
+// Allows load module build in a different environment
+#undef AST_BUILDOPT_SUM
+#define AST_BUILDOPT_SUM ""
 
 AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "UniMRCP Speech Engine");
