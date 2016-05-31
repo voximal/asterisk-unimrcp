@@ -11,5 +11,4 @@ aclocal -I build/acmacros
 automake --foreign --add-missing --copy
 autoconf
 
-
 rm -rf autom4te.cache
