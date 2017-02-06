@@ -120,11 +120,11 @@ static ast_mrcp_application_t *mrcpsynth = NULL;
 /* The enumeration of application options (excluding the MRCP params). */
 enum mrcpsynth_option_flags {
 	MRCPSYNTH_PROFILE        = (1 << 0),
-	MRCPSYNTH_INTERRUPT      = (2 << 0),
-	MRCPSYNTH_FILENAME       = (3 << 0),
-	MRCPSYNTH_KEEPSESSION    = (4 << 0),
-	MRCPSYNTH_ASTERISKVOLUME = (5 << 0),
-	MRCPSYNTH_SENDDTMF       = (6 << 0)
+	MRCPSYNTH_INTERRUPT      = (1 << 1),
+	MRCPSYNTH_FILENAME       = (1 << 2),
+	MRCPSYNTH_KEEPSESSION    = (1 << 3),
+	MRCPSYNTH_ASTERISKVOLUME = (1 << 4),
+	MRCPSYNTH_SENDDTMF       = (1 << 5)
 };
 
 /* The enumeration of option arguments. */
@@ -411,7 +411,10 @@ static apt_bool_t synth_on_message_receive(mrcp_application_t *application, mrcp
 	      }
 
 				/* Got SPEAK-COMPLETE. */
+			  const char *completion_cause = apr_psprintf(schannel->pool, "%03d", synth_header->completion_cause);
+		   	pbx_builtin_setvar_helper(schannel->chan, "SYNTH_COMPLETION_CAUSE", completion_cause);
 				ast_log(LOG_DEBUG, "(%s) SPEAK-COMPLETE\n", schannel->name);
+
 
         if (synth_header)
        	ast_log(LOG_DEBUG, "(%s) Get result completion cause: %03d reason: %s\n",
@@ -587,6 +590,7 @@ static int synth_channel_speak(speech_channel_t *schannel, const char *content, 
   else
   {
 		ast_log(LOG_ERROR, "(unknown) channel error!\n");
+    return -1;
   }
 
 	return status;
@@ -872,13 +876,12 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 		ast_answer(chan);
 	ast_stopstream(chan);
 
-  if ((mrcpsynth_options.flags & MRCPSYNTH_ASTERISKVOLUME) == MRCPSYNTH_ASTERISKVOLUME)
-  {
-    if (mrcpsynth_options.params[OPT_ARG_ASTERISKVOLUME])
-    gain = atoi(mrcpsynth_options.params[OPT_ARG_ASTERISKVOLUME]);
-    else
-    gain = 0;
-  }
+	const char *filename = NULL;
+  /* New record feature
+	if ((mrcpsynth_options.flags & MRCPSYNTH_FILENAME) == MRCPSYNTH_FILENAME) {
+		filename = mrcpsynth_options.params[OPT_ARG_FILENAME];
+	}
+  */
 
 	if ((mrcpsynth_options.flags & MRCPSYNTH_FILENAME) == MRCPSYNTH_FILENAME) {
 		char* filename;
@@ -902,6 +905,14 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 		}
 	}
 
+  if ((mrcpsynth_options.flags & MRCPSYNTH_ASTERISKVOLUME) == MRCPSYNTH_ASTERISKVOLUME)
+  {
+    if (mrcpsynth_options.params[OPT_ARG_ASTERISKVOLUME])
+    gain = atoi(mrcpsynth_options.params[OPT_ARG_ASTERISKVOLUME]);
+    else
+    gain = 0;
+  }
+
   ast_format_compat *nwriteformat = ast_channel_get_speechwriteformat(chan, mrcpsynth_session.pool);
   ast_format_compat *nreadformat = ast_get_linearformat(mrcpsynth_session.pool);
 
@@ -922,6 +933,7 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
       mrcpsynth,
       nwriteformat,
       samplerate,
+			filename,
       chan);
 
 	  if (mrcpsynth_session.schannel == NULL) {
