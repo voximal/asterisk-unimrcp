@@ -28,7 +28,7 @@
 #include "ast_compat_defs.h"
 
 #define AST_MODULE "res_speech_unimrcp" 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.74 $")
+ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.75 $")
 
 #include <asterisk/module.h>
 #include <asterisk/config.h>
@@ -1893,7 +1893,7 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
         apt_header_section_field_remove(&uni_speech->properties->header_section,header_field);
 			}
 			else
-			if(mrcp_message->start_line.version == MRCP_VERSION_1 && (unit = strchr(value, 's')))
+			if(mrcp_message->start_line.version == MRCP_VERSION_1 && ((value[0] >= '0') && (value[0] <= '9') && (unit = strchr(value, 's'))))
 			{
         float fvalue;
 				float factor = 1000;
@@ -1934,6 +1934,13 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 				// No previous free, use the pool
         apt_string_assign(&header_field->value, value, mrcp_message->pool);
 			}
+      else
+      {
+        ast_log(LOG_DEBUG, "No changes needed : %s=%s\n", header_field->name.buf, value);
+
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+      }
 
 	  }
 	}
