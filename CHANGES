@@ -1,3 +1,128 @@
+Changes for Asterisk UniMRCP Modules 1.5.1
+
+1. Generic Speech Recognition API (res_speech_unimrcp.so)
+
+    * N/A.
+
+2. Dialplan Applications (app_unimrcp.so)
+
+  2.1. MRCPSynth()
+
+    * N/A.
+
+  2.2. MRCPRecog()
+
+    * When recognition fails, set RECOG_COMPLETION_CAUSE variable, if available. Issue #19.
+    * Skip voice frames with zero length fed by Asterisk under certain circumstances.
+    * When recognition completes, make sure to stop the ongoing prompt, if any. This problem was encountered when
+      START-OF-INPUT and RECOGNITION-COMPLETE events were received almost instantaneously.
+
+  2.3. SynthAndRecog()
+
+    * When recognition fails, set RECOG_COMPLETION_CAUSE variable, if available. Issue #19.
+    * Skip voice frames with zero length fed by Asterisk under certain circumstances.
+    * Allow different profiles be specified for synthesis and recognition. Merged a pull request submitted by Mihail. Thanks.
+    * When recognition completes, make sure to stop the ongoing prompt, if any. This problem was encountered when
+      START-OF-INPUT and RECOGNITION-COMPLETE events were received almost instantaneously.
+
+  2.4. Framework
+
+    * N/A.
+
+3. Miscellaneous
+
+    * Added support for Asterisk 15.
+
+
+Changes for Asterisk UniMRCP Modules 1.5.0
+
+1. Generic Speech Recognition API (res_speech_unimrcp.so)
+
+    * Allow built-in and HTTP grammars be specified with SpeechActivateGrammar().
+    * Fixed a crash in processing of on_terminate_event() occurred when the MRCP server unexpectedly disconnects
+      while recognition is in progress. Issue #13.
+    * Fixed a compilation warning by taking out an unused variable.
+
+2. Dialplan Applications (app_unimrcp.so)
+
+  2.1. MRCPSynth()
+
+    * Initialized all the dispatcher event handlers to prevent an unconditional move reported by valgrind,
+      which could occur on an unexpected session termination initiated by the MRCP server.
+    * Instead of calculating bytes per sample on every written frame, do it once per speech channel creation.
+
+  2.2. MRCPRecog()
+
+    * Fixed a possible invalid read attempt reported by valgrind, which could occur as a result of mrcp_application_session_id_get()
+      being called after mrcp_application_channel_add() completed with an error.
+    * Initialized all the dispatcher event handlers to prevent an unconditional move reported by valgrind,
+      which could occur on an unexpected session termination initiated by the MRCP server.
+    * Fixed the name of grammar delimiters option in documentation (not a functional change).
+    * Improved the detection of end of file play by using ast_channel_streamid() and ast_channel_timingfunc(), when available.
+      Fixed issue #14. Thanks scgm11.
+
+  2.3. SynthAndRecog()
+
+    * Fixed a possible invalid read attempt reported by valgrind, which could occur as a result of mrcp_application_session_id_get()
+      being called after mrcp_application_channel_add() completed with an error.
+    * Initialized all the dispatcher event handlers to prevent an unconditional move reported by valgrind,
+      which could occur on an unexpected session termination initiated by the MRCP server.
+    * Improved the detection of end of file play by using ast_channel_streamid() and ast_channel_timingfunc(), when available.
+      Fixed issue #14. Thanks scgm11.
+
+  2.4. Framework
+
+    * Fixed the application options bitmasks. Issue #7. Thanks Borja.
+    * Replaced hard-coded SPEECH_CHANNEL_TIMEOUT by a new configuration parameter speech-channel-timeout, which can be set from mrcp.conf.
+      Merged pull request #9. Thanks Userator.
+    * Added support for 16 kHz sampling rate.
+    * Use UniMRCP var directory instead of data for SPEECH_CHANNEL_DUMP_DIR.
+    * Fixed a transcoding issue when Asterisk 13 and above is used with a native format being neither PCMU, PCMA or Linear PCM.
+    * Added support for a new grammar type "application/xml" used to dynamically load an XML-based speech context for the Google SR plugin.
+
+3. Miscellaneous
+
+    * Enhanced the version detection routine in asterisk.m4 by stripping off additional trailing characters, if present.
+    * Added a test for Asterisk include directory in asterisk.m4 by returning an error, if not found.
+    * Added a new configure option --with-asterisk-doc, which allows to explicitly specify the location of Asterisk XML documentation
+      directory. If not set, the directory is implicitly determined as before.
+    * Added support for Asterisk 14. Fixed issue #15.
+
+
+Changes for Asterisk UniMRCP Modules 1.4.0
+
+1. Generic Speech Recognition API (res_speech_unimrcp.so)
+
+    * N/A.
+
+2. Dialplan Applications (app_unimrcp.so)
+
+  2.1. MRCPSynth()
+
+    * Added a new dialplan variable SYNTH_COMPLETION_CAUSE to get the Completion-Cause header field value received with the SPEAK-COMPLETE event.
+      Merged pull request #3. Thanks kkocaerkek.
+    * Fixed support for the option "f" (Issue-4).
+
+  2.2. MRCPRecog()
+
+    * Added a new dialplan variable RECOG_SID set upon application termination, when available.
+
+  2.3. SynthAndRecog()
+
+    * Added a new dialplan variable RECOG_SID set upon application termination, when available.
+
+  2.4. Framework
+
+    * Added a new function speech_channel_get_id() to retrieve an associated MRCP session identifier, when available.
+    * Allow sip-t1, sip-t2, sip-t4 and sip-t1x64 timeouts be specified via mrcp.conf.
+    * Allow NTATAG_TIMER_C be specified via mrcp.conf.
+    * Encapsulated the function ast_write() into the speech channel interface.
+
+3. Miscellaneous
+
+    * N/A.
+
+
 Changes for Asterisk UniMRCP Modules 1.3.1
 
 1. Generic Speech Recognition API (res_speech_unimrcp.so)

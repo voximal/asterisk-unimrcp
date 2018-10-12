@@ -27,8 +27,9 @@
 /* Asterisk includes. */
 #include "ast_compat_defs.h"
 
-#define AST_MODULE "res_speech_unimrcp" 
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.75 $")
+#define AST_MODULE "res_speech_unimrcp"
+
+ASTERISK_REGISTER_FILE()
 
 #include <asterisk/module.h>
 #include <asterisk/config.h>
@@ -39,6 +40,7 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.75 $")
 #include <apr_thread_proc.h>
 #include <apr_tables.h>
 #include <apr_hash.h>
+
 #include <unimrcp_client.h>
 #include <mrcp_application.h>
 #include <mrcp_message.h>
@@ -254,6 +256,9 @@ static int uni_recog_create_internal(struct ast_speech *speech, ast_format_compa
   else
   profile++;
 
+  ast_log(LOG_DEBUG, "Speech profile %s (custom %s, default %s)\n",
+    profile, speech->engine->name, uni_engine.profile);
+
 	/* Create session instance */
 	session = mrcp_application_session_create(uni_engine.application, profile, speech);
 	if(!session) {
@@ -429,11 +434,6 @@ static int uni_recog_stop(struct ast_speech *speech)
 	uni_speech_t *uni_speech = speech->data;
 	mrcp_message_t *mrcp_message;
 
-	if (uni_speech->properties)
-	{
-
-	}
-	
 	if(!uni_speech->is_inprogress) {
 		return 0;
 	}
@@ -745,6 +745,13 @@ static int uni_recog_unload_grammar(struct ast_speech *speech, ast_compat_const 
 		uni_recog_stop(speech);
 	}
 
+	if (uni_speech->properties)
+	{
+  	ast_log(LOG_DEBUG, "(%s) Unload grammar name: Destroy properties\n", uni_speech->name);
+    mrcp_message_header_destroy(uni_speech->properties);
+    uni_speech->properties = NULL;
+	}
+
 	ast_log(LOG_DEBUG, "(%s) Unload grammar name: %s\n",
 				uni_speech->name,
 				grammar_name);
@@ -946,6 +953,7 @@ static int uni_recog_start(struct ast_speech *speech)
 	/* Get/allocate generic header */
 	generic_header = mrcp_generic_header_prepare(mrcp_message);
 	if(generic_header) {
+		char *tmp;
 		apr_hash_index_t *it;
 		void *val;
 		const void *key;
@@ -972,17 +980,30 @@ static int uni_recog_start(struct ast_speech *speech)
     }
       else
       {
-    	  ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
-  			content = apr_pstrcat(mrcp_message->pool,"session:", grammar_name,NULL);
+    	  //ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
+  			//content = apr_pstrcat(mrcp_message->pool,"session:", grammar_name,NULL);
+
+  			tmp = strchr(grammar_name,':');
+  			if(tmp) {
+  				ast_log(LOG_DEBUG, "(%s) Reference grammar %s\n",uni_speech->name, val);
+  	  		content = apr_pstrcat(mrcp_message->pool,content,"\n",grammar_name,NULL);
+  			}
+  			else {
+  				ast_log(LOG_DEBUG, "(%s) Reference session grammar %s\n",uni_speech->name, val);
+  	  		content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+  			}
       }
 
 			it = apr_hash_next(it);
 		}
+
+
 		for(; it; it = apr_hash_next(it)) {
 			apr_hash_this(it,&key,NULL,&val);
 			grammar_name = val;
 
       binary = apr_hash_get(uni_speech->binary_grammars, grammar_name, APR_HASH_KEY_STRING);
+
       if (binary)
       {
         grammar_name = binary;
@@ -991,8 +1012,18 @@ static int uni_recog_start(struct ast_speech *speech)
       }
       else
       {
-    	  ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
-	  		content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+    	  //ast_log(LOG_DEBUG, "(%s) Active grammar : %s\n",uni_speech->name, val);
+	  		//content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+
+  			tmp = strchr(grammar_name,':');
+  			if(tmp) {
+  				ast_log(LOG_DEBUG, "(%s) Reference grammar %s\n",uni_speech->name, val);
+  	  		content = apr_pstrcat(mrcp_message->pool,content,"\n",grammar_name,NULL);
+  			}
+  			else {
+  				ast_log(LOG_DEBUG, "(%s) Reference session grammar %s\n",uni_speech->name, val);
+  	  		content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+  			}
       }
 
 		}
@@ -1037,6 +1068,8 @@ static int uni_recog_start(struct ast_speech *speech)
 			else
 			value[0]=0;
 
+      ast_log(LOG_DEBUG, "First value character : %c\n", value[0]);
+
       ast_log(LOG_DEBUG, "MRCP Version : %d\n", mrcp_message->start_line.version);
 
       if (uni_engine.removeswi && !strncmp(header_field->name.buf, "swi", 3))
@@ -1045,7 +1078,7 @@ static int uni_recog_start(struct ast_speech *speech)
         apt_header_section_field_remove(&uni_speech->properties->header_section,header_field);
 			}
 			else
-			if(mrcp_message->start_line.version == MRCP_VERSION_1 && (unit = strchr(value, 's')))
+			if(mrcp_message->start_line.version == MRCP_VERSION_1 && ((value[0] >= '0') && (value[0] <= '9') && (unit = strchr(value, 's'))))
 			{
         float fvalue;
 				float factor = 1000;
@@ -1068,7 +1101,7 @@ static int uni_recog_start(struct ast_speech *speech)
 
         sprintf(value, "%d", (int)fvalue);
 
-        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+        ast_log(LOG_DEBUG, "Change the value (duration with 's') for MRCP V1 : %s=%s\n", header_field->name.buf, value);
 
 				// No previous free, use the pool
         apt_string_assign(&header_field->value, value, mrcp_message->pool);
@@ -1081,12 +1114,18 @@ static int uni_recog_start(struct ast_speech *speech)
 
         sprintf(value, "%d", (int)fvalue);
 
-        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+        ast_log(LOG_DEBUG, "Change the value (real) for MRCP V1 : %s=%s\n", header_field->name.buf, value);
 
 				// No previous free, use the pool
         apt_string_assign(&header_field->value, value, mrcp_message->pool);
 			}
+      else
+      {
+        ast_log(LOG_DEBUG, "No changes needed : %s=%s\n", header_field->name.buf, value);
 
+				// No previous free, use the pool
+        apt_string_assign(&header_field->value, value, mrcp_message->pool);
+      }
 	  }
 
   	/* Add properties set by loadgrammar */
@@ -1413,12 +1452,6 @@ struct ast_speech_result* uni_recog_get(struct ast_speech *speech)
 	mrcp_recog_header_t *recog_header;
 
 	uni_speech_t *uni_speech = speech->data;
-
-	if (uni_speech->properties)
-	{
-    mrcp_message_header_destroy(uni_speech->properties);
-    uni_speech->properties = NULL;
-	}
 
 	if(uni_speech->is_inprogress) {
 		uni_recog_stop(speech);
@@ -1875,6 +1908,8 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 			else
 			value[0]=0;
 
+      ast_log(LOG_DEBUG, "First value character : %c\n", value[0]);
+
       if (uni_engine.removeswi && !strncmp(header_field->name.buf, "swi", 3))
 			{
         ast_log(LOG_DEBUG, "Remove Nuance property : %s=%s\n", header_field->name.buf, header_field->value);
@@ -1916,7 +1951,7 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 
         sprintf(value, "%d", (int)fvalue);
 
-        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+        ast_log(LOG_DEBUG, "Change the value (duration with 's') for MRCP V1 : %s=%s\n", header_field->name.buf, value);
 
 				// No previous free, use the pool
         apt_string_assign(&header_field->value, value, mrcp_message->pool);
@@ -1929,7 +1964,7 @@ static apt_bool_t uni_recog_properties_set(uni_speech_t *uni_speech)
 
         sprintf(value, "%d", (int)fvalue);
 
-        ast_log(LOG_DEBUG, "Change the value for MRCP V1 : %s=%s\n", header_field->name.buf, value);
+        ast_log(LOG_DEBUG, "Change the value (real) for MRCP V1 : %s=%s\n", header_field->name.buf, value);
 
 				// No previous free, use the pool
         apt_string_assign(&header_field->value, value, mrcp_message->pool);

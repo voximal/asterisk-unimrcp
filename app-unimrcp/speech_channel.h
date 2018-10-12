@@ -28,15 +28,13 @@
  * Specifies the output directory to store streams in, used if 
  * SPEECH_CHANNEL_DUMP is enabled.
  */
-#define SPEECH_CHANNEL_DUMP_DIR   UNIMRCP_DIR_LOCATION"/data"
+#define SPEECH_CHANNEL_DUMP_DIR   UNIMRCP_DIR_LOCATION"/var"
 
 /*
- * Set SPEECH_CHANNEL_TARCE to 1 to trace a statement per 
- * a channel read or write attempt.
+ * Set SPEECH_CHANNEL_TRACE to 1 to trace a statement per 
+ * channel read or write attempt.
  */
 #define SPEECH_CHANNEL_TRACE   0
-
-#define SPEECH_CHANNEL_TIMEOUT_USEC				(30 * 1000000)
 
 /* Type of MRCP channel. */
 enum speech_channel_type_t {
@@ -87,6 +85,8 @@ struct speech_channel_t {
 	mpf_audio_stream_t *stream;
 	/* UniMRCP DTMF digit generator. */
 	mpf_dtmf_generator_t *dtmf_generator;
+	/* MRCP session identifier. */
+	char *session_id;
 	/* Memory pool. */
 	apr_pool_t *pool;
 	/* Synchronizes channel state/ */
@@ -100,15 +100,19 @@ struct speech_channel_t {
 	/* Speech format. */
 	ast_format_compat *format;
 	/* Codec. */
-	char *codec;
+	const char *codec;
 	/* Rate. */
 	apr_uint16_t rate;
+	/* Bytes per sample. */
+	apr_uint16_t bytes_per_sample;
 	/* Silence byte. */
 	apr_byte_t silence;
 	/* App specific data. */
 	void *data;
 	/* Asterisk channel. Needed to stop playback on barge-in. */
 	struct ast_channel *chan;
+	/* File to store data streamed to Asterisk. */
+	FILE *rec_file;
 
 #if SPEECH_CHANNEL_DUMP
 	FILE *stream_in;
@@ -129,7 +133,9 @@ enum grammar_type_t {
 	/* application/x-nuance-gsl. */
 	GRAMMAR_TYPE_NUANCE_GSL,
 	/* application/x-jsgf. */
-	GRAMMAR_TYPE_JSGF
+	GRAMMAR_TYPE_JSGF,
+	/* application/xml. */
+	GRAMMAR_TYPE_XML
 };  
 typedef enum grammar_type_t grammar_type_t;
 
@@ -161,7 +167,6 @@ struct recognizer_data_t {
 };
 typedef struct recognizer_data_t recognizer_data_t;
 
-
 /* Use this function to set the current channel state without locking the 
  * speech channel.  Do this if you already have the speech channel locked.
  */
@@ -180,7 +185,7 @@ speech_channel_t *speech_channel_create(
 						speech_channel_type_t type,
 						ast_mrcp_application_t *app,
 						ast_format_compat *format,
-						apr_uint16_t rate,
+						const char *rec_file_path,
 						struct ast_channel *chan);
 
 /* Destroy the speech channel. */
@@ -201,8 +206,8 @@ int speech_channel_read(speech_channel_t *schannel, void *data, apr_size_t *len,
 /* Write synthesized speech / speech to be recognized. */
 int speech_channel_write(speech_channel_t *schannel, void *data, apr_size_t *len);
 
-/* Get MRCP session identifier of speech channel, when avaialble. */
-const char* speech_channel_get_id(speech_channel_t *schannel);
+/* Write synthesized speech to Asterisk. */
+int speech_channel_ast_write(speech_channel_t *schannel, void *data, apr_size_t len);
 
 /* Convert channel status to string. */
 const char *speech_channel_status_to_string(speech_channel_status_t status);

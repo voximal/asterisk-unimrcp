@@ -42,23 +42,24 @@
 #include "audio_queue.h"
 #include "speech_channel.h"
 
-#define MIME_TYPE_PLAIN_TEXT					"text/plain"
-#define MIME_TYPE_URI_LIST						"text/uri-list"
+#define MIME_TYPE_PLAIN_TEXT   "text/plain"
+#define MIME_TYPE_URI_LIST     "text/uri-list"
 
-#define XML_ID									"<?xml"
-#define SRGS_ID									"<grammar"
-#define SSML_ID									"<speak"
-#define GSL_ID									";GSL2.0"
-#define ABNF_ID									"#ABNF"
-#define JSGF_ID									"#JSGF"
-#define BUILTIN_ID								"builtin:"
-#define SESSION_ID								"session:"
-#define HTTP_ID									"http://"
-#define HTTPS_ID								"https://"
-#define FILE_ID									"file://"
-#define INLINE_ID								"inline:"
+#define XML_ID                 "<?xml"
+#define SRGS_ID                "<grammar"
+#define SSML_ID                "<speak"
+#define GSL_ID                 ";GSL2.0"
+#define ABNF_ID                "#ABNF"
+#define JSGF_ID                "#JSGF"
+#define GSC_ID                 "<speech-context"
+#define BUILTIN_ID             "builtin:"
+#define SESSION_ID             "session:"
+#define HTTP_ID                "http://"
+#define HTTPS_ID               "https://"
+#define FILE_ID                "file://"
+#define INLINE_ID              "inline:"
 
-#define AUDIO_FILE_ID							"audio:"
+#define AUDIO_FILE_ID          "audio:"
 
 /* --- MRCP SPEECH CHANNEL --- */
 
@@ -153,7 +154,7 @@ int speech_channel_bargeinoccurred(speech_channel_t *schannel)
 				ast_log(LOG_WARNING, "(%s) [speech_channel_bargeinoccurred] Failed to send BARGE_IN_OCCURRED message\n", schannel->name);
 			else if (schannel->cond != NULL) {
 				while (schannel->state == SPEECH_CHANNEL_PROCESSING) {
-					if (apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC) == APR_TIMEUP) {
+					if (apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout) == APR_TIMEUP) {
 						break;
 					}
 				}
@@ -183,7 +184,7 @@ speech_channel_t *speech_channel_create(
 						speech_channel_type_t type,
 						ast_mrcp_application_t *app,
 						ast_format_compat *format,
-						apr_uint16_t rate,
+						const char *rec_file_path,
 						struct ast_channel *chan)
 {
 	speech_channel_t *schan = NULL;
@@ -210,16 +211,9 @@ speech_channel_t *speech_channel_create(
 		}
 
 		schan->format = format;
-		const char *codec = format_to_str(format);
-		if ((codec == NULL) || (strlen(codec) == 0)) {
-			ast_log(LOG_WARNING, "(%s) No codec specified, assuming \"L16\"\n", schan->name);
-			schan->codec = "L16";
-		} else
-			schan->codec = apr_pstrdup(pool, codec);
-		if ((schan->codec == NULL) || (strlen(schan->codec) == 0)) {
-			ast_log(LOG_WARNING, "(%s) Unable to allocate codec for channel, using \"L16\"\n", schan->name);
-			schan->codec = "L16";
-		}
+		schan->codec = ast_format_get_unicodec(format);
+		schan->rate = ast_format_get_sample_rate(format);
+		schan->bytes_per_sample = ast_format_get_bytes_per_sample(format);
 
 		schan->profile = NULL;
 		schan->type = type;
@@ -228,16 +222,17 @@ speech_channel_t *speech_channel_create(
 		schan->unimrcp_channel = NULL;
 		schan->stream = NULL;
 		schan->dtmf_generator = NULL;
+		schan->session_id = NULL;
 		schan->pool = pool;
 		schan->mutex = NULL;
 		schan->cond = NULL;
 		schan->state = SPEECH_CHANNEL_CLOSED;
 		schan->audio_queue = NULL;
-		schan->rate = rate;
 		schan->data = NULL;
 		schan->chan = chan;
+		schan->rec_file = NULL;
 
-		if (strstr("L16", schan->codec)) {
+		if (strstr("LPCM", schan->codec)) {
 			schan->silence = 0;
 		} else {
 			/* 8-bit PCMU, PCMA. */
@@ -256,6 +251,13 @@ speech_channel_t *speech_channel_create(
 		} else {
 			ast_log(LOG_DEBUG, "Created speech channel: Name=%s, Type=%s, Codec=%s, Rate=%u on %s\n", schan->name, speech_channel_type_to_string(schan->type), schan->codec, schan->rate,
 				ast_channel_name(chan));
+		}
+		
+		if (!ast_strlen_zero(rec_file_path)) {
+			schan->rec_file = fopen(rec_file_path, "wb");
+			if(!schan->rec_file) {
+				ast_log(LOG_WARNING, "(%s) Unable to open recording file for writing: %s\n", schan->name, rec_file_path);
+			}
 		}
 	}
 
@@ -305,7 +307,7 @@ speech_channel_t *speech_channel_create(
 static mpf_termination_t *speech_channel_create_mpf_termination(speech_channel_t *schannel)
 {   
 	mpf_stream_capabilities_t *capabilities = NULL;
-	int sample_rates;
+	int sample_rate;
 
 	if (schannel->type == SPEECH_CHANNEL_SYNTHESIZER)
 		capabilities = mpf_sink_stream_capabilities_create(schannel->unimrcp_session->pool);
@@ -317,23 +319,8 @@ static mpf_termination_t *speech_channel_create_mpf_termination(speech_channel_t
 		return NULL;
 	}
 
-	/* UniMRCP should transcode whatever the MRCP server wants to use into LPCM
-	 * (host-byte ordered L16) for us. Asterisk may not support all of these.
-	 */
-	if (schannel->rate == 16000)
-		sample_rates = MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000;
-	else if (schannel->rate == 32000)
-		sample_rates = MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000 | MPF_SAMPLE_RATE_32000;
-	else if (schannel->rate == 48000)
-		sample_rates = MPF_SAMPLE_RATE_8000 | MPF_SAMPLE_RATE_16000 | MPF_SAMPLE_RATE_48000;
-	else
-		sample_rates = MPF_SAMPLE_RATE_8000;
-
-	/* TO DO : Check if all of these are supported on Asterisk for all codecs. */
-	if (strcasecmp(schannel->codec, "L16") == 0)
-		mpf_codec_capabilities_add(&capabilities->codecs, sample_rates, "LPCM");
-	else
-		mpf_codec_capabilities_add(&capabilities->codecs, sample_rates, schannel->codec);
+	sample_rate = mpf_sample_rate_mask_get(schannel->rate);
+	mpf_codec_capabilities_add(&capabilities->codecs, sample_rate, schannel->codec);
 
 	return mrcp_application_audio_termination_create(
 					schannel->unimrcp_session,                        /* Session, termination belongs to. */
@@ -378,21 +365,24 @@ int speech_channel_destroy(speech_channel_t *schannel)
 		ast_log(LOG_DEBUG, "(%s) Waiting for MRCP session to terminate\n", schannel->name);
 		while (schannel->state != SPEECH_CHANNEL_CLOSED) {
 			if (schannel->cond != NULL) {
-				if ((apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC) == APR_TIMEUP) && (!warned)) {
+				if ((apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout) == APR_TIMEUP) && (!warned)) {
 					warned = 1;
-					ast_log(LOG_WARNING, "(%s) MRCP session has not terminated after %d ms\n", schannel->name, SPEECH_CHANNEL_TIMEOUT_USEC / 1000);
+					ast_log(LOG_WARNING, "(%s) MRCP session has not terminated after %" APR_TIME_T_FMT " ms\n", schannel->name, apr_time_as_msec(globals.speech_channel_timeout));
 				}
 			}
 		}
 	}
-
+	
 	if (schannel->state != SPEECH_CHANNEL_CLOSED) {
 		ast_log(LOG_ERROR, "(%s) Failed to destroy channel.  Continuing\n", schannel->name);
 	}
 
+	if (schannel->rec_file) {
+		fclose(schannel->rec_file);
+	}
+
 	if (schannel->dtmf_generator != NULL) {
 		mpf_dtmf_generator_destroy(schannel->dtmf_generator);
-		schannel->dtmf_generator = NULL;
 		ast_log(LOG_DEBUG, "(%s) DTMF generator destroyed\n", schannel->name);
 	}
 
@@ -421,6 +411,7 @@ int speech_channel_destroy(speech_channel_t *schannel)
 	schannel->unimrcp_channel = NULL;
 	schannel->stream = NULL;
 	schannel->dtmf_generator = NULL;
+	schannel->session_id = NULL;
 	schannel->pool = NULL;
 	schannel->mutex = NULL;
 	schannel->cond = NULL;
@@ -428,6 +419,7 @@ int speech_channel_destroy(speech_channel_t *schannel)
 	schannel->codec = NULL;
 	schannel->data = NULL;
 	schannel->chan = NULL;
+	schannel->rec_file = NULL;
 
 	return 0;
 }
@@ -503,7 +495,7 @@ int speech_channel_open(speech_channel_t *schannel, ast_mrcp_profile_t *profile)
 
 	/* Wait for channel to be ready. */
 	while (schannel->state == SPEECH_CHANNEL_CLOSED)
-		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 	if (schannel->state == SPEECH_CHANNEL_READY) {
 		ast_log(LOG_DEBUG, "(%s) channel is ready\n", schannel->name);
@@ -517,7 +509,7 @@ int speech_channel_open(speech_channel_t *schannel, ast_mrcp_profile_t *profile)
 			ast_log(LOG_WARNING, "(%s) Unable to terminate application session\n", schannel->name);
 
 		/* Wait for session to be cleaned up. */
-		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 		if (schannel->state != SPEECH_CHANNEL_CLOSED) {
 			/* Major issue. Can't retry. */
@@ -581,7 +573,7 @@ int speech_channel_stop(speech_channel_t *schannel)
 				ast_log(LOG_WARNING, "(%s) Failed to send STOP message\n", schannel->name);
 			else if (schannel->cond != NULL) {
 				while (schannel->state == SPEECH_CHANNEL_PROCESSING) {
-					if (apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC) == APR_TIMEUP) {
+					if (apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout) == APR_TIMEUP) {
 						break;
 					}
 				}
@@ -716,18 +708,36 @@ int speech_channel_write(speech_channel_t *schannel, void *data, apr_size_t *len
 	return status;
 }
 
-/* Get MRCP session identifier of speech channel, when avaialble. */
-const char* speech_channel_get_id(speech_channel_t *schannel)
+/* Fill the frame with data. */
+static APR_INLINE void ast_frame_fill(speech_channel_t *schannel, struct ast_frame *fr, void *data, apr_size_t size)
 {
-	const apt_str_t *session_id;
-	if(!schannel->unimrcp_session)
-		return NULL;
+	memset(fr, 0, sizeof(*fr));
+	fr->frametype = AST_FRAME_VOICE;
+	ast_frame_set_format(fr, schannel->format);
+	fr->datalen = size;
+	fr->samples = size / schannel->bytes_per_sample;
+	ast_frame_set_data(fr, data);
+	fr->mallocd = 0;
+	fr->offset = AST_FRIENDLY_OFFSET;
+	fr->src = __PRETTY_FUNCTION__;
+	fr->delivery.tv_sec = 0;
+	fr->delivery.tv_usec = 0;
+}
 
-	session_id = mrcp_application_session_id_get(schannel->unimrcp_session);
-	if(!session_id)
-		return NULL;
+int speech_channel_ast_write(speech_channel_t *schannel, void *data, apr_size_t len)
+{
+	struct ast_frame fr;
+	ast_frame_fill(schannel, &fr, data, len);
 
-	return session_id->buf;
+	if (schannel->rec_file)
+		fwrite(data, 1, len, schannel->rec_file);
+	
+	if (ast_write(schannel->chan, &fr) < 0) {
+		ast_log(LOG_WARNING, "(%s) Unable to write frame to channel: %s\n", schannel->name, strerror(errno));
+		return -1;
+	}
+	
+	return 0;
 }
 
 /* Playback the specified sound file. */
@@ -910,6 +920,8 @@ int determine_grammar_type(speech_channel_t *schannel, const char *grammar_data,
 			tmp_grammar = GRAMMAR_TYPE_SRGS;
 		} else if (text_starts_with(grammar_data, JSGF_ID)) {
 			tmp_grammar = GRAMMAR_TYPE_JSGF;
+		} else if (text_starts_with(grammar_data, GSC_ID)) {
+			tmp_grammar = GRAMMAR_TYPE_XML;
 		} else {
 			/* Unable to determine grammar type. For backward compatibility, assume it's SRGS+XML */
 			tmp_grammar = GRAMMAR_TYPE_SRGS_XML;
@@ -970,6 +982,7 @@ const char *grammar_type_to_mime(grammar_type_t type, const ast_mrcp_profile_t *
 		case GRAMMAR_TYPE_SRGS_XML: return profile->srgs_xml_mime_type;
 		case GRAMMAR_TYPE_NUANCE_GSL: return profile->gsl_mime_type;
 		case GRAMMAR_TYPE_JSGF: return profile->jsgf_mime_type;
+		case GRAMMAR_TYPE_XML: return profile->xml_mime_type;
 		default: return "";
 	}
 }

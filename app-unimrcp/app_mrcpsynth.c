@@ -100,9 +100,11 @@
 		</syntax>
 		<description>
 			<para>This application establishes an MRCP session for speech synthesis.</para>
-			<para>If synthesis completed successfully, the variable ${SYNTHSTATUS} is set to "OK"; otherwise, if an error occurred, 
+			<para>If synthesis completed, the variable ${SYNTHSTATUS} is set to "OK"; otherwise, if an error occurred,
 			the variable ${SYNTHSTATUS} is set to "ERROR". If the caller hung up while the synthesis was in-progress, 
 			the variable ${SYNTHSTATUS} is set to "INTERRUPTED".</para>
+			<para>The variable ${SYNTH_COMPLETION_CAUSE} indicates whether synthesis completed normally or with an error.
+			("000" - normal, "001" - barge-in, "002" - parse-failure, ...) </para>
 		</description>
 		<see-also>
 			<ref type="application">MRCPRecog</ref>
@@ -156,6 +158,7 @@ struct mrcpsynth_session_t {
 	speech_channel_t   *schannel;
 	FILE               *fp;
 	ast_format_compat  *writeformat;
+	ast_format_compat  *rawwriteformat;
 	struct ast_filestream *file;
 };
 
@@ -231,37 +234,30 @@ static mrcpsynth_session_t *find_mrcpsynth(struct ast_channel *chan)
 /* Handle the UniMRCP responses sent to session terminate requests. */
 static apt_bool_t speech_on_session_terminate(mrcp_application_t *application, mrcp_session_t *session, mrcp_sig_status_code_e status)
 {
-	speech_channel_t *schannel;
-
-	if (session != NULL)
-		schannel = (speech_channel_t *)mrcp_application_session_object_get(session);
-	else
-		schannel = NULL;
+	speech_channel_t *schannel = get_speech_channel(session);
+	if (!schannel) {
+		ast_log(LOG_ERROR, "speech_on_session_terminate: unknown channel error!\n");
+		return FALSE;
+	}
 
 	ast_log(LOG_DEBUG, "(%s) speech_on_session_terminate\n", schannel->name);
 
-	if (schannel != NULL) {
-		ast_log(LOG_DEBUG, "(%s) Destroying MRCP session\n", schannel->name);
+	ast_log(LOG_DEBUG, "(%s) Destroying MRCP session\n", schannel->name);
+	if (!mrcp_application_session_destroy(session))
+		ast_log(LOG_WARNING, "(%s) Unable to destroy application session\n", schannel->name);
 
-		if (!mrcp_application_session_destroy(session))
-			ast_log(LOG_WARNING, "(%s) Unable to destroy application session\n", schannel->name);
-
-		speech_channel_set_state(schannel, SPEECH_CHANNEL_CLOSED);
-	} else
-		ast_log(LOG_ERROR, "(unknown) channel error!\n");
-
+	speech_channel_set_state(schannel, SPEECH_CHANNEL_CLOSED);
 	return TRUE;
 }
 
 /* Handle the UniMRCP responses sent to channel add requests. */
 static apt_bool_t speech_on_channel_add(mrcp_application_t *application, mrcp_session_t *session, mrcp_channel_t *channel, mrcp_sig_status_code_e status)
 {
-	speech_channel_t *schannel;
-
-	if (channel != NULL)
-		schannel = (speech_channel_t *)mrcp_application_channel_object_get(channel);
-	else
-		schannel = NULL;
+	speech_channel_t *schannel = get_speech_channel(session);
+	if (!schannel || !channel) {
+		ast_log(LOG_ERROR, "speech_on_channel_add: unknown channel error!\n");
+		return FALSE;
+	}
 
 	ast_log(LOG_DEBUG, "(%s) speech_on_channel_add\n", schannel->name);
 
@@ -450,7 +446,7 @@ static APR_INLINE void ast_frame_fill(ast_format_compat *format, struct ast_fram
 	fr->frametype = AST_FRAME_VOICE;
 	ast_frame_set_format(fr, format);
 	fr->datalen = size;
-	fr->samples = size / format_to_bytes_per_sample(format);
+	fr->samples = size / ast_format_get_bytes_per_sample(format);
 	ast_frame_set_data(fr, data);
 	fr->mallocd = 0;
 	fr->offset = AST_FRIENDLY_OFFSET;
@@ -464,7 +460,7 @@ static apt_bool_t synth_stream_write2(mpf_audio_stream_t *stream, const mpf_fram
 {
 	speech_channel_t *schannel;
 
-	if (stream != NULL)
+	if (stream)
 		schannel = (speech_channel_t *)stream->obj;
 	else
 		schannel = NULL;
@@ -475,12 +471,7 @@ static apt_bool_t synth_stream_write2(mpf_audio_stream_t *stream, const mpf_fram
 	}
 
 	if (frame->codec_frame.size > 0 && (frame->type & MEDIA_FRAME_TYPE_AUDIO) == MEDIA_FRAME_TYPE_AUDIO) {
-		struct ast_frame fr;
-		ast_frame_fill(schannel->format, &fr, frame->codec_frame.buffer, frame->codec_frame.size);
-
-		if (ast_write(schannel->chan, &fr) < 0) {
-			ast_log(LOG_WARNING, "(%s) Unable to write frame to channel: %s\n", schannel->name, strerror(errno));
-		}
+		speech_channel_ast_write(schannel, frame->codec_frame.buffer, frame->codec_frame.size);
 	}
 
 	return TRUE;
@@ -498,7 +489,12 @@ static apt_bool_t synth_stream_write(mpf_audio_stream_t *stream, const mpf_frame
 
 	if ((schannel != NULL) && (stream != NULL) && (frame != NULL)) {
 		apr_size_t size = frame->codec_frame.size;
-		speech_channel_write(schannel, frame->codec_frame.buffer, &size);
+
+		//speech_channel_write(schannel, frame->codec_frame.buffer, &size);
+  	if (frame->codec_frame.size > 0 && (frame->type & MEDIA_FRAME_TYPE_AUDIO) == MEDIA_FRAME_TYPE_AUDIO) {
+  		speech_channel_ast_write(schannel, frame->codec_frame.buffer, frame->codec_frame.size);
+  	}
+
 	} else
 		ast_log(LOG_ERROR, "(unknown) channel error!\n");
 
@@ -513,7 +509,12 @@ static int synth_channel_speak(speech_channel_t *schannel, const char *content, 
 	mrcp_generic_header_t *generic_header = NULL;
 	mrcp_synth_header_t *synth_header = NULL;
 
-	if ((schannel != NULL) && (content != NULL)  && (content_type != NULL)) {
+	if (!schannel || !content || !content_type) {
+		ast_log(LOG_ERROR, "synth_channel_speak: unknown channel error!\n");
+		return -1;
+	}
+
+  {
 		if (schannel->mutex != NULL)
 			apr_thread_mutex_lock(schannel->mutex);
 
@@ -573,7 +574,7 @@ static int synth_channel_speak(speech_channel_t *schannel, const char *content, 
 
 		/* Wait for IN PROGRESS. */
 		if ((schannel->mutex != NULL) && (schannel->cond != NULL))
-			apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+			apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 		if (schannel->state != SPEECH_CHANNEL_PROCESSING) {
 			if (schannel->mutex != NULL)
@@ -587,11 +588,6 @@ static int synth_channel_speak(speech_channel_t *schannel, const char *content, 
 		if (schannel->mutex != NULL)
 			apr_thread_mutex_unlock(schannel->mutex);
 	}
-  else
-  {
-		ast_log(LOG_ERROR, "(unknown) channel error!\n");
-    return -1;
-  }
 
 	return status;
 }
@@ -714,6 +710,8 @@ static int mrcpsynth_exit(struct ast_channel *chan, mrcpsynth_session_t *mrcpsyn
 
 		if (mrcpsynth_session->writeformat)
 			ast_channel_set_writeformat(chan, mrcpsynth_session->writeformat);
+		if (mrcpsynth_session->rawwriteformat)
+			ast_channel_set_rawwriteformat(chan, mrcpsynth_session->rawwriteformat);
 
     if (!find_mrcpsynth(chan))
     {
@@ -840,6 +838,7 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
   mrcpsynth_session.schannel = NULL;
 	mrcpsynth_session.fp = NULL;
 	mrcpsynth_session.writeformat = NULL;
+  mrcpsynth_session.rawwriteformat = NULL;
 
   mrcpsynth_session.file = NULL;
 
@@ -914,10 +913,11 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
   }
 
   ast_format_compat *nwriteformat = ast_channel_get_speechwriteformat(chan, mrcpsynth_session.pool);
-  ast_format_compat *nreadformat = ast_get_linearformat(mrcpsynth_session.pool);
+  //ast_format_compat *nreadformat = ast_get_linearformat(mrcpsynth_session.pool);
+  ast_format_compat *nreadformat = ast_format_slin;
 
   int samplerate = 8000;
-  int framesize = format_to_bytes_per_sample(nwriteformat) * (DEFAULT_FRAMESIZE / 2);
+  int framesize = ast_format_get_bytes_per_sample(nwriteformat) * (DEFAULT_FRAMESIZE / 2);
   char buffer[framesize];
 
   if (!mrcpsynth_session_stored)
@@ -932,7 +932,7 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
       SPEECH_CHANNEL_SYNTHESIZER,
       mrcpsynth,
       nwriteformat,
-      samplerate,
+      //samplerate,
 			filename,
       chan);
 
@@ -970,18 +970,21 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 
   ast_log(LOG_DEBUG, "Set Asterisk channel formats.\n");
 
-	ast_format_compat *owriteformat = ast_channel_get_writeformat(chan, mrcpsynth_session.pool);;
+	ast_format_compat *owriteformat = ast_channel_get_writeformat(chan, mrcpsynth_session.pool);
+	ast_format_compat *orawwriteformat = ast_channel_get_rawwriteformat(chan, mrcpsynth_session.pool);
 	ast_channel_set_writeformat(chan, nwriteformat);
+  ast_channel_set_rawwriteformat(chan, nwriteformat);
 
 	ast_format_compat *oreadformat = ast_channel_get_readformat(chan, mrcpsynth_session.pool);
 	ast_channel_set_readformat(chan, nreadformat);
 	//mrcprecog_session.readformat = oreadformat;
 
-  ast_log(LOG_NOTICE, "(%s) Original Channel codecs : Read %s, Write %s\n", name, format_to_str(oreadformat), format_to_str(owriteformat));
-  ast_log(LOG_NOTICE, "(%s) MRCP Channel codecs set : Read %s, Write %s\n", name, format_to_str(nreadformat), format_to_str(nwriteformat));
+  ast_log(LOG_NOTICE, "(%s) Original Channel codecs : Read %s, Write %s\n", name, ast_format_get_unicodec(oreadformat), ast_format_get_unicodec(owriteformat));
+  ast_log(LOG_NOTICE, "(%s) MRCP Channel codecs set : Read %s, Write %s\n", name, ast_format_get_unicodec(nreadformat), ast_format_get_unicodec(nwriteformat));
 
 	// Save previous format
 	mrcpsynth_session.writeformat = owriteformat;
+  mrcpsynth_session.rawwriteformat = orawwriteformat;
 
 	const char *content = NULL;
 	const char *content_type = NULL;
@@ -1083,7 +1086,7 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 				ast_frame_set_format(&fr, nwriteformat);
 				fr.datalen = len;
 				/* fr.samples = len / 2; */
-				fr.samples = len / format_to_bytes_per_sample(nwriteformat);
+				fr.samples = len / ast_format_get_bytes_per_sample(nwriteformat);
 				ast_frame_set_data(&fr, buffer);
 				fr.mallocd = 0;
 				fr.offset = AST_FRIENDLY_OFFSET;
@@ -1109,7 +1112,7 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 			} else {
 				if (rres == 0) {
 					/* next = ast_tvadd(next, ast_samp2tv(framesize/2, samplerate)); */
-					next = ast_tvadd(next, ast_samp2tv(framesize / format_to_bytes_per_sample(nwriteformat), samplerate));
+					next = ast_tvadd(next, ast_samp2tv(framesize / ast_format_get_bytes_per_sample(nwriteformat), samplerate));
 					ast_log(LOG_WARNING, "(%s) Writer started for audio\n", name);
 				}
 			}
@@ -1231,6 +1234,11 @@ static int app_synth_exec(struct ast_channel *chan, ast_app_data data)
 
 				ast_frfree(f);
 			}
+
+  		if (mrcpsynth_session.schannel->state != SPEECH_CHANNEL_PROCESSING) {
+  			/* end of prompt */
+  			rres = -1;
+  		}
 		}
 	} while (rres == 0);
 
@@ -1276,6 +1284,8 @@ int load_mrcpsynth_app()
 	mrcpsynth->dispatcher.on_channel_add = speech_on_channel_add;
 	mrcpsynth->dispatcher.on_channel_remove = speech_on_channel_remove;
 	mrcpsynth->dispatcher.on_message_receive = synth_on_message_receive;
+	mrcpsynth->dispatcher.on_terminate_event = NULL;
+	mrcpsynth->dispatcher.on_resource_discover = NULL;
 	mrcpsynth->audio_stream_vtable.destroy = NULL;
 	mrcpsynth->audio_stream_vtable.open_rx = NULL;
 	mrcpsynth->audio_stream_vtable.close_rx = NULL;

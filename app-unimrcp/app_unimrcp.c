@@ -58,7 +58,6 @@
 
 #if AST_VERSION_AT_LEAST(1,4,0)
 #define AST_COMPAT_STATIC static
-ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.14 $")
 #else  /* 1.2 */
 #define AST_MODULE_LOAD_DECLINE -1
 #define AST_COMPAT_STATIC
@@ -69,8 +68,9 @@ ASTERISK_FILE_VERSION(__FILE__, "$Revision: 1.14 $")
 #include <stdio.h>
 #endif
 
-#define AST_MODULE "app_unimrcp"
+ASTERISK_REGISTER_FILE()
 
+#define AST_MODULE "app_unimrcp"
 #include "asterisk/module.h"
 
 /* UniMRCP includes. */
@@ -293,7 +293,7 @@ AST_COMPAT_STATIC int reload(void)
 	return 0;
 }
 
-// i6net : Allows load module build in a different environment
+// Allows load module build in a different environment
 #undef AST_BUILDOPT_SUM
 #define AST_BUILDOPT_SUM ""
 

@@ -78,7 +78,7 @@
 					<option name="enm"> <para>Early nomatch (true/false).</para> </option>
 					<option name="iwu"> <para>Input waveform URI.</para> </option>
 					<option name="mt"> <para>Media type.</para> </option>
-					<option name="pv"> <para>Prosody volume (silent/x-soft/soft/medium/load/x-loud/default).</para> </option>
+					<option name="pv"> <para>Prosody volume (silent/x-soft/soft/medium/loud/x-loud/default).</para> </option>
 					<option name="pr"> <para>Prosody rate (x-slow/slow/medium/fast/x-fast/default).</para> </option>
 					<option name="vn"> <para>Voice name to use (e.g. "Daniel", "Karin", etc.).</para> </option>
 					<option name="vg"> <para>Voice gender to use (e.g. "male", "female").</para> </option>
@@ -127,12 +127,12 @@ static ast_mrcp_application_t *synthandrecog = NULL;
 /* The enumeration of application options (excluding the MRCP params). */
 enum sar_option_flags {
 	SAR_RECOG_PROFILE          = (1 << 0),
-	SAR_SYNTH_PROFILE          = (2 << 0),
-	SAR_BARGEIN                = (3 << 0),
-	SAR_GRAMMAR_DELIMITERS     = (4 << 0),
-	SAR_URI_ENCODED_RESULTS    = (5 << 0),
-	SAR_OUTPUT_DELIMITERS      = (6 << 0),
-	SAR_INPUT_TIMERS           = (7 << 0)
+	SAR_SYNTH_PROFILE          = (1 << 1),
+	SAR_BARGEIN                = (1 << 2),
+	SAR_GRAMMAR_DELIMITERS     = (1 << 3),
+	SAR_URI_ENCODED_RESULTS    = (1 << 4),
+	SAR_OUTPUT_DELIMITERS      = (1 << 5),
+	SAR_INPUT_TIMERS           = (1 << 6)
 };
 
 /* The enumeration of option arguments. */
@@ -183,10 +183,11 @@ struct sar_session_t {
 	speech_channel_t      *recog_channel;      /* recognition channel */
 	speech_channel_t      *synth_channel;      /* synthesis channel, if any */
 	ast_format_compat     *readformat;         /* old read format, to be restored */
+	ast_format_compat     *rawreadformat;      /* old raw read format, to be restored (>= Asterisk 13) */
 	ast_format_compat     *writeformat;        /* old write format, to be restored */
+	ast_format_compat     *rawwriteformat;     /* old raw write format, to be restored (>= Asterisk 13) */
 	ast_format_compat     *nreadformat;        /* new read format used for recognition */
 	ast_format_compat     *nwriteformat;       /* new write format used for synthesis */
-	int                    samplerate;         /* supported sampling rate */
 	apr_array_header_t    *prompts;            /* list of prompt items */
 	int                    cur_prompt;         /* current prompt index */
 	struct ast_filestream *filestream;         /* filestream, if any */
@@ -276,6 +277,13 @@ static apt_bool_t speech_on_channel_add(mrcp_application_t *application, mrcp_se
 		else
 			codec_name = "unknown";
 
+		if (!schannel->session_id) {
+			const apt_str_t *session_id = mrcp_application_session_id_get(session);
+			if (session_id && session_id->buf) {
+				schannel->session_id = apr_pstrdup(schannel->pool, session_id->buf);
+			}
+		}
+		
 		ast_log(LOG_NOTICE, "(%s) Channel ready codec=%s, sample rate=%d\n",
 			schannel->name,
 			codec_name,
@@ -370,22 +378,6 @@ static apt_bool_t synth_on_message_receive(speech_channel_t *schannel, mrcp_mess
 	return TRUE;
 }
 
-/* Fill the frame with data. */
-static APR_INLINE void ast_frame_fill(ast_format_compat *format, struct ast_frame *fr, void *data, apr_size_t size)
-{
-	memset(fr, 0, sizeof(*fr));
-	fr->frametype = AST_FRAME_VOICE;
-	ast_frame_set_format(fr, format);
-	fr->datalen = size;
-	fr->samples = size / format_to_bytes_per_sample(format);
-	ast_frame_set_data(fr, data);
-	fr->mallocd = 0;
-	fr->offset = AST_FRIENDLY_OFFSET;
-	fr->src = __PRETTY_FUNCTION__;
-	fr->delivery.tv_sec = 0;
-	fr->delivery.tv_usec = 0;
-}
-
 /* Incoming TTS data from UniMRCP. */
 static apt_bool_t synth_stream_write(mpf_audio_stream_t *stream, const mpf_frame_t *frame)
 {
@@ -402,12 +394,7 @@ static apt_bool_t synth_stream_write(mpf_audio_stream_t *stream, const mpf_frame
 	}
 
 	if (frame->codec_frame.size > 0 && (frame->type & MEDIA_FRAME_TYPE_AUDIO) == MEDIA_FRAME_TYPE_AUDIO) {
-		struct ast_frame fr;
-		ast_frame_fill(schannel->format, &fr, frame->codec_frame.buffer, frame->codec_frame.size);
-
-		if (ast_write(schannel->chan, &fr) < 0) {
-			ast_log(LOG_WARNING, "(%s) Unable to write frame to channel: %s\n", schannel->name, strerror(errno));
-		}
+		speech_channel_ast_write(schannel, frame->codec_frame.buffer, frame->codec_frame.size);
 	}
 
 	return TRUE;
@@ -472,7 +459,7 @@ static int synth_channel_speak(speech_channel_t *schannel, const char *content, 
 	}
 
 	/* Wait for IN PROGRESS. */
-	apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+	apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 	if (schannel->state != SPEECH_CHANNEL_PROCESSING) {
 		apr_thread_mutex_unlock(schannel->mutex);
@@ -831,7 +818,7 @@ static int recog_channel_start(speech_channel_t *schannel, const char *name, int
 	}
 
 	/* Wait for IN PROGRESS. */
-	apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+	apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 	if (schannel->state != SPEECH_CHANNEL_PROCESSING) {
 		apr_thread_mutex_unlock(schannel->mutex);
@@ -901,7 +888,7 @@ static int recog_channel_load_grammar(speech_channel_t *schannel, const char *na
 			return -1;
 		}
 
-		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, SPEECH_CHANNEL_TIMEOUT_USEC);
+		apr_thread_cond_timedwait(schannel->cond, schannel->mutex, globals.speech_channel_timeout);
 
 		if (schannel->state != SPEECH_CHANNEL_READY) {
 			apr_thread_mutex_unlock(schannel->mutex);
@@ -944,8 +931,10 @@ static apt_bool_t recog_on_message_receive(speech_channel_t *schannel, mrcp_mess
 				/* RECOGNIZE failed to start. */
 				if (recog_hdr->completion_cause == RECOGNIZER_COMPLETION_CAUSE_UNKNOWN)
 					ast_log(LOG_DEBUG, "(%s) RECOGNIZE failed: status = %d\n", schannel->name, message->start_line.status_code);
-				else
+				else {
 					ast_log(LOG_DEBUG, "(%s) RECOGNIZE failed: status = %d, completion-cause = %03d\n", schannel->name, message->start_line.status_code, recog_hdr->completion_cause);
+					recog_channel_set_results(schannel, recog_hdr->completion_cause, NULL, NULL);
+				}
 				speech_channel_set_state(schannel, SPEECH_CHANNEL_ERROR);
 			} else if (message->start_line.request_state == MRCP_REQUEST_STATE_PENDING)
 				/* RECOGNIZE is queued. */
@@ -982,7 +971,12 @@ static apt_bool_t recog_on_message_receive(speech_channel_t *schannel, mrcp_mess
 					ast_log(LOG_DEBUG, "(%s) Grammar loaded\n", schannel->name);
 					speech_channel_set_state(schannel, SPEECH_CHANNEL_READY);
 				} else {
-					ast_log(LOG_DEBUG, "(%s) Grammar failed to load, status code = %d\n", schannel->name, message->start_line.status_code);
+					if (recog_hdr->completion_cause == RECOGNIZER_COMPLETION_CAUSE_UNKNOWN)
+						ast_log(LOG_DEBUG, "(%s) Grammar failed to load, status code = %d\n", schannel->name, message->start_line.status_code);
+					else {
+						ast_log(LOG_DEBUG, "(%s) Grammar failed to load, status code = %d, completion-cause = %03d\n", schannel->name, message->start_line.status_code, recog_hdr->completion_cause);
+						recog_channel_set_results(schannel, recog_hdr->completion_cause, NULL, NULL);
+					}
 					speech_channel_set_state(schannel, SPEECH_CHANNEL_ERROR);
 				}
 			}
@@ -1129,6 +1123,14 @@ static int synthandrecog_option_apply(sar_options_t *options, const char *key, c
 		options->flags |= SAR_RECOG_PROFILE | SAR_SYNTH_PROFILE;
 		options->params[OPT_ARG_RECOG_PROFILE] = value;
 		options->params[OPT_ARG_SYNTH_PROFILE] = value;
+	} else if (strcasecmp(key, "prec") == 0) {
+		/* Separate configuration option for recognizer operation */
+		options->flags |= SAR_RECOG_PROFILE;
+		options->params[OPT_ARG_RECOG_PROFILE] = value;
+	} else if (strcasecmp(key, "psyn") == 0) {
+		/* Separate configuration option for synthesizer operation */
+		options->flags |= SAR_SYNTH_PROFILE;
+		options->params[OPT_ARG_SYNTH_PROFILE] = value;
 	} else if (strcasecmp(key, "t") == 0) {
 		apr_hash_set(options->recog_hfs, "Recognition-Timeout", APR_HASH_KEY_STRING, value);
 	} else if (strcasecmp(key, "b") == 0) {
@@ -1227,7 +1229,7 @@ static sar_prompt_item_t* synthandrecog_prompt_play(sar_session_t *sar_session, 
 											SPEECH_CHANNEL_SYNTHESIZER,
 											synthandrecog,
 											sar_session->nwriteformat,
-											sar_session->samplerate,
+											NULL,
 											sar_session->chan);
 			if (!sar_session->synth_channel) {
 				return NULL;
@@ -1279,17 +1281,20 @@ static int synthandrecog_exit(struct ast_channel *chan, sar_session_t *sar_sessi
 	if (sar_session) {
 		if (sar_session->writeformat)
 			ast_channel_set_writeformat(chan, sar_session->writeformat);
+		if (sar_session->rawwriteformat)
+			ast_channel_set_rawwriteformat(chan, sar_session->rawwriteformat);
 
 		if (sar_session->readformat)
 			ast_channel_set_readformat(chan, sar_session->readformat);
+		if (sar_session->rawreadformat)
+			ast_channel_set_rawreadformat(chan, sar_session->rawreadformat);
 
 		if (sar_session->synth_channel)
 			speech_channel_destroy(sar_session->synth_channel);
 
 		if (sar_session->recog_channel) {
-			const char *session_id = speech_channel_get_id(sar_session->recog_channel);
-			if(session_id)
-				pbx_builtin_setvar_helper(chan, "RECOG_SID", session_id);
+			if (sar_session->recog_channel->session_id)
+				pbx_builtin_setvar_helper(chan, "RECOG_SID", sar_session->recog_channel->session_id);
 			speech_channel_destroy(sar_session->recog_channel);
 		}
 
@@ -1360,10 +1365,11 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 	sar_session.recog_channel = NULL;
 	sar_session.synth_channel = NULL;
 	sar_session.readformat = NULL;
+	sar_session.rawreadformat = NULL;
 	sar_session.writeformat = NULL;
+	sar_session.rawwriteformat = NULL;
 	sar_session.nreadformat = NULL;
 	sar_session.nwriteformat = NULL;
-	sar_session.samplerate = 8000;
 	sar_session.prompts = apr_array_make(sar_session.pool, 1, sizeof(sar_prompt_item_t));
 	sar_session.cur_prompt = 0;
 	sar_session.filestream = NULL;
@@ -1405,7 +1411,7 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 										SPEECH_CHANNEL_RECOGNIZER,
 										synthandrecog,
 										nreadformat,
-										sar_session.samplerate,
+										NULL,
 										chan);
 	if (sar_session.recog_channel == NULL) {
 		return synthandrecog_exit(chan, &sar_session, SPEECH_CHANNEL_STATUS_ERROR);
@@ -1440,17 +1446,23 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 
 	/* Get old read format. */
 	ast_format_compat *oreadformat = ast_channel_get_readformat(chan, sar_session.pool);
+	ast_format_compat *orawreadformat = ast_channel_get_rawreadformat(chan, sar_session.pool);
 	/* Get old write format. */
 	ast_format_compat *owriteformat = ast_channel_get_writeformat(chan, sar_session.pool);
+	ast_format_compat *orawwriteformat = ast_channel_get_rawwriteformat(chan, sar_session.pool);
 
 	/* Set read format. */
 	ast_channel_set_readformat(chan, nreadformat);
+	ast_channel_set_rawreadformat(chan, nreadformat);
 	sar_session.readformat = oreadformat;
+	sar_session.rawreadformat = orawreadformat;
 	sar_session.nreadformat = nreadformat;
 
 	/* Set write format. */
 	ast_channel_set_writeformat(chan, nwriteformat);
+	ast_channel_set_rawwriteformat(chan, nwriteformat);
 	sar_session.writeformat = owriteformat;
+	sar_session.rawwriteformat = orawwriteformat;
 	sar_session.nwriteformat = nwriteformat;
 
 	/* Get grammar delimiters. */
@@ -1482,6 +1494,12 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 		/* Load grammar. */
 		if (recog_channel_load_grammar(sar_session.recog_channel, grammar_name, grammar_type, grammar_content) != 0) {
 			ast_log(LOG_ERROR, "(%s) Unable to load grammar\n", recog_name);
+
+			const char *completion_cause = NULL;
+			recog_channel_get_results(sar_session.recog_channel, 0, &completion_cause, NULL, NULL);
+			if (completion_cause)
+				pbx_builtin_setvar_helper(chan, "RECOG_COMPLETION_CAUSE", completion_cause);
+			
 			return synthandrecog_exit(chan, &sar_session, SPEECH_CHANNEL_STATUS_ERROR);
 		}
 
@@ -1606,6 +1624,12 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 	/* Start recognition. */
 	if (recog_channel_start(sar_session.recog_channel, recog_name, start_input_timers, sar_options.recog_hfs) != 0) {
 		ast_log(LOG_ERROR, "(%s) Unable to start recognition\n", recog_name);
+
+		const char *completion_cause = NULL;
+		recog_channel_get_results(sar_session.recog_channel, 0, &completion_cause, NULL, NULL);
+		if (completion_cause)
+			pbx_builtin_setvar_helper(chan, "RECOG_COMPLETION_CAUSE", completion_cause);
+		
 		return synthandrecog_exit(chan, &sar_session, SPEECH_CHANNEL_STATUS_ERROR);
 	}
 
@@ -1617,8 +1641,10 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 		}
 	}
 
+#if !AST_VERSION_AT_LEAST(11,0,0)
 	off_t read_filestep = 0;
 	off_t read_filelength;
+#endif
 	int waitres;
 	/* Continue with recognition. */
 	while ((waitres = ast_waitfor(chan, 100)) >= 0) {
@@ -1641,6 +1667,12 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 			end_of_prompt = 0;
 			if (prompt_item->is_audio_file) {
 				if (sar_session.filestream) {
+#if AST_VERSION_AT_LEAST(11,0,0)
+					if (ast_channel_streamid(chan) == -1 && ast_channel_timingfunc(chan) == NULL) {
+						ast_stopstream(chan);
+						sar_session.filestream = NULL;
+					}
+#else
 					read_filelength = ast_tellstream(sar_session.filestream);
 					if(!read_filestep)
 						read_filestep = read_filelength;
@@ -1650,6 +1682,7 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 						sar_session.filestream = NULL;
 						read_filestep = 0;
 					}
+#endif
 				}
 			}
 			else {
@@ -1700,7 +1733,7 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 			break;
 		}
 
-		if (f->frametype == AST_FRAME_VOICE) {
+		if (f->frametype == AST_FRAME_VOICE && f->datalen) {
 			len = f->datalen;
 			if (speech_channel_write(sar_session.recog_channel, ast_frame_get_data(f), &len) != 0) {
 				ast_frfree(f);
@@ -1723,6 +1756,18 @@ static int app_synthandrecog_exec(struct ast_channel *chan, ast_app_data data)
 		}
 
 		ast_frfree(f);
+	}
+
+	if (prompt_processing) {
+		ast_log(LOG_DEBUG, "(%s) Stop prompt\n", recog_name);
+		if (prompt_item->is_audio_file) {
+			ast_stopstream(chan);
+			sar_session.filestream = NULL;
+		}
+		else {
+			/* do nothing, synth channel will be destroyed anyway */
+		}
+		prompt_processing = 0;
 	}
 
 	const char *completion_cause = NULL;
@@ -1805,6 +1850,8 @@ int load_synthandrecog_app()
 	synthandrecog->dispatcher.on_channel_add = speech_on_channel_add;
 	synthandrecog->dispatcher.on_channel_remove = NULL;
 	synthandrecog->dispatcher.on_message_receive = speech_on_message_receive;
+	synthandrecog->dispatcher.on_terminate_event = NULL;
+	synthandrecog->dispatcher.on_resource_discover = NULL;
 	synthandrecog->audio_stream_vtable.destroy = NULL;
 	synthandrecog->audio_stream_vtable.open_rx = recog_stream_open;
 	synthandrecog->audio_stream_vtable.close_rx = NULL;
