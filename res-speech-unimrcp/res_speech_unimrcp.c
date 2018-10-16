@@ -986,11 +986,11 @@ static int uni_recog_start(struct ast_speech *speech)
   			tmp = strchr(grammar_name,':');
   			if(tmp) {
   				ast_log(LOG_DEBUG, "(%s) Reference grammar %s\n",uni_speech->name, val);
-  	  		content = apr_pstrcat(mrcp_message->pool,content,"\n",grammar_name,NULL);
+  	  		content = apr_pstrcat(mrcp_message->pool,grammar_name,NULL);
   			}
   			else {
   				ast_log(LOG_DEBUG, "(%s) Reference session grammar %s\n",uni_speech->name, val);
-  	  		content = apr_pstrcat(mrcp_message->pool,content,"\nsession:",grammar_name,NULL);
+  	  		content = apr_pstrcat(mrcp_message->pool,"session:",grammar_name,NULL);
   			}
       }
 
@@ -1028,6 +1028,7 @@ static int uni_recog_start(struct ast_speech *speech)
 
 		}
 		if(content) {
+			ast_log(LOG_DEBUG, "(%s) Set body content : %s\n",uni_speech->name, content);
 			apt_string_set(&mrcp_message->body,content);
 		}
 	}
